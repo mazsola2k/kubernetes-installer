@@ -490,3 +490,148 @@ def check_mssql_availability(vm_name):
         return {'available': True, 'message': 'MSSQL availability check not implemented'}
     except Exception as e:
         return {'available': False, 'message': f'Error checking MSSQL availability: {e}'}
+
+
+# RedHatVM Handlers (KubeVirt)
+@kopf.on.create('infra.example.com', 'v1', 'redhatvms')
+@kopf.on.update('infra.example.com', 'v1', 'redhatvms')
+def handle_redhatvm(body, meta, spec, status, namespace, diff, old, new, patch, **kwargs):
+    """Handle Red Hat VM resource changes via unified controller playbook"""
+    terminal_phases = ['Ready', 'Failed', 'Skipped']
+    if status and status.get('phase') in terminal_phases and status.get('observedGeneration') == meta.get('generation'):
+        msg = f"[OPERATOR] Skipping execution for {meta.get('name')} (phase={status.get('phase')})"
+        log_event(msg)
+        patch.status['phase'] = status.get('phase')
+        patch.status['message'] = status.get('message', '')
+        patch.status['observedGeneration'] = status.get('observedGeneration')
+        return
+    log_event("[OPERATOR] handle_redhatvm triggered!")
+    name = meta.get('name')
+    action = get_var('action', spec, 'install')
+    vm_name = get_var('vm_name', spec, name)
+    kind = get_var('kind', spec, 'VirtualMachine')
+    manifest_path = get_var('manifest_path', spec, '/root/kubernetes-installer/manifest-controller/rhel9-vm-cr.yaml')
+    kubevirt_namespace = get_var('kubevirt_namespace', spec, namespace)
+    vm_image = get_var('vm_image', spec, 'registry.redhat.io/rhel9/rhel-guest-image:9.6')
+    vm_cpu_cores = get_var('vm_cpu_cores', spec, 2)
+    vm_memory = get_var('vm_memory', spec, '4Gi')
+    root_password = get_var('root_password', spec, 'redhat')
+    user_password = get_var('user_password', spec, 'redhat')
+    subscription_username = get_var('subscription_username', spec, 'XXXXX')
+    subscription_password = get_var('subscription_password', spec, 'XXXX')
+    syspurpose_usage = get_var('syspurpose_usage', spec, 'Development/Test')
+    disk_bus = get_var('disk_bus', spec, 'virtio')
+    log_event(f"[OPERATOR] CR received: name={name}, action={action}, vm_name={vm_name}, kind={kind}")
+    try:
+        patch.status['phase'] = 'InProgress'
+        patch.status['message'] = f"{action.title()} in progress for Red Hat VM {vm_name}"
+        patch.status['reason'] = 'Processing'
+        patch.status['observedGeneration'] = meta.get('generation')
+        now = datetime.utcnow().isoformat() + 'Z'
+        cond = {
+            'type': 'Ready',
+            'status': 'False',
+            'reason': 'Processing',
+            'message': f"{action.title()} in progress for Red Hat VM {vm_name}",
+            'lastTransitionTime': now,
+        }
+        existing = status.get('conditions', []) if status else []
+        patch.status['conditions'] = [c for c in existing if c.get('type') != 'Ready'] + [cond]
+    except Exception:
+        pass
+    try:
+        kopf.info(body, reason='Processing', message=f'Starting {action} for Red Hat VM {vm_name}')
+        playbook_path = "/root/kubernetes-installer/redhat-server-controller.yaml"
+        playbook_vars = {
+            'action': action,
+            'kind': kind,
+            'manifest_path': manifest_path,
+            'kubevirt_namespace': kubevirt_namespace,
+            'vm_name': vm_name,
+            'vm_image': vm_image,
+            'vm_cpu_cores': vm_cpu_cores,
+            'vm_memory': vm_memory,
+            'root_password': root_password,
+            'user_password': user_password,
+            'subscription_username': subscription_username,
+            'subscription_password': subscription_password,
+            'syspurpose_usage': syspurpose_usage,
+            'disk_bus': disk_bus,
+            'redhat_vault_secret': get_var('redhat_vault_secret', spec, 'secret/redhat-vm-admin'),
+            'redhat_user': get_var('redhat_user', spec, 'redhat'),
+        }
+        log_event(f"[OPERATOR] Running controller playbook for {action} on Red Hat VM {vm_name}")
+        result = run_ansible_playbook(playbook_path, playbook_vars)
+        if result['success']:
+            log_event(f"[OPERATOR] Playbook succeeded for {action} on Red Hat VM {vm_name}")
+            patch.status['phase'] = 'Ready'
+            patch.status['message'] = f"Red Hat VM {vm_name} {action} completed successfully"
+            patch.status['reason'] = 'Completed'
+            patch.status['observedGeneration'] = meta.get('generation')
+            now = datetime.utcnow().isoformat() + 'Z'
+            cond = {
+                'type': 'Ready',
+                'status': 'True',
+                'reason': 'Completed',
+                'message': f"Red Hat VM {vm_name} {action} completed successfully",
+                'lastTransitionTime': now,
+            }
+            existing = status.get('conditions', []) if status else []
+            patch.status['conditions'] = [c for c in existing if c.get('type') != 'Ready'] + [cond]
+            return
+        else:
+            log_event(f"[OPERATOR] Playbook failed for {action} on Red Hat VM {vm_name}: {result['error']}")
+            patch.status['phase'] = 'Failed'
+            patch.status['message'] = f"Failed to {action} Red Hat VM: {result['error']}"
+            patch.status['reason'] = 'Error'
+            patch.status['observedGeneration'] = meta.get('generation')
+            now = datetime.utcnow().isoformat() + 'Z'
+            cond = {
+                'type': 'Ready',
+                'status': 'False',
+                'reason': 'Error',
+                'message': f"Failed to {action} Red Hat VM: {result['error']}",
+                'lastTransitionTime': now,
+            }
+            existing = status.get('conditions', []) if status else []
+            patch.status['conditions'] = [c for c in existing if c.get('type') != 'Ready'] + [cond]
+            return
+    except Exception as e:
+        error_msg = f"[OPERATOR] Error processing Red Hat VM {name}: {e}"
+        log_event(error_msg)
+        try:
+            kopf.exception(body, reason='Error', message=error_msg)
+        except Exception as patch_err:
+            log_event(f"[OPERATOR] Failed to patch CR status due to: {patch_err}")
+        patch.status['phase'] = 'Failed'
+        patch.status['message'] = error_msg
+        patch.status['reason'] = 'Exception'
+        patch.status['observedGeneration'] = meta.get('generation')
+        return
+    
+
+@kopf.on.delete('infra.example.com', 'v1', 'redhatvms')
+def delete_redhatvm(body, meta, spec, status, namespace, patch, **kwargs):
+    """Handle Red Hat VM resource deletion via unified controller playbook"""
+    name = meta.get('name')
+    vm_name = get_var('vmName', spec, name)
+    kind = get_var('kind', spec, 'VirtualMachine')
+    manifest_path = get_var('manifest_path', spec, '/root/kubernetes-installer/manifest-controller/rhel9-vm-cr.yaml')
+    kubevirt_namespace = get_var('kubevirt_namespace', spec, namespace)
+    patch.status['phase'] = 'Terminating'
+    patch.status['message'] = f"Delete requested for Red Hat VM {vm_name}"
+    patch.status['reason'] = 'DeleteRequested'
+    patch.status['observedGeneration'] = meta.get('generation')
+    playbook_path = "/root/kubernetes-installer/redhat-server-controller.yaml"
+    log_event(f"[OPERATOR] Running uninstall playbook for Red Hat VM {vm_name}")
+    result = run_ansible_playbook(playbook_path, {
+        'action': 'uninstall',
+        'kind': kind,
+        'manifest_path': manifest_path,
+        'kubevirt_namespace': kubevirt_namespace,
+        'vm_name': vm_name,
+    })
+    if result['success']:
+        log_event(f"[OPERATOR] Uninstall playbook completed for Red Hat VM {vm_name}")
+    else:
+        log_event(f"[OPERATOR] Uninstall playbook failed for Red Hat VM {vm_name}: {result.get('error')}")

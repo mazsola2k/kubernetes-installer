@@ -1,0 +1,32 @@
+---
+# Tasks for removing RHEL9 VM from KubeVirt
+- name: Set uninstall parameters
+  ansible.builtin.set_fact:
+    vm_name: "{{ vm_name | default('rhel9-vm') }}"
+    vm_namespace: "{{ vm_namespace | default('default') }}"
+
+- name: Delete RHEL9 VM
+  kubernetes.core.k8s:
+    state: absent
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ vm_name }}"
+    namespace: "{{ vm_namespace }}"
+
+- name: Wait for VM to be deleted
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ vm_name }}"
+    namespace: "{{ vm_namespace }}"
+  register: vm_status
+  failed_when: vm_status.resources | length > 0
+  until: vm_status.resources | length == 0
+  retries: 10
+  delay: 3
+
+- name: Reminder Remove unused Red Hat VM subscription
+  ansible.builtin.debug:
+    msg: |
+      ⚠️  Do not forget to remove your unused Red Hat VM subscription from Red Hat Inventory:
+      https://console.redhat.com/insights/inventory

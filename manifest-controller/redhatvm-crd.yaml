@@ -1,0 +1,86 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: redhatvms.infra.example.com
+spec:
+  group: infra.example.com
+  names:
+    plural: redhatvms
+    singular: redhatvm
+    kind: RedHatVM
+    shortNames:
+      - rhvm
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                vm_name:
+                  type: string
+                vm_image:
+                  type: string
+                vm_cpu_cores:
+                  type: integer
+                vm_memory:
+                  type: string
+                root_password:
+                  type: string
+                user_password:
+                  type: string
+                subscription_username:
+                  type: string
+                subscription_password:
+                  type: string
+                syspurpose_usage:
+                  type: string
+                disk_bus:
+                  type: string
+                redhat_user:
+                  type: string
+                redhat_vault_secret:
+                  type: string
+                action:
+                  type: string
+                  enum: [install, uninstall]
+                kind:
+                  type: string
+                  default: VirtualMachine
+                manifest_path:
+                  type: string
+                kubevirt_namespace:
+                  type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                message:
+                  type: string
+                reason:
+                  type: string
+                observedGeneration:
+                  type: integer
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+      subresources:
+        status: {}

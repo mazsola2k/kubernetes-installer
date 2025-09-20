@@ -1,0 +1,21 @@
+apiVersion: infra.example.com/v1
+kind: RedHatVM
+metadata:
+  name: rhel9-vm-demo
+  namespace: default
+spec:
+  vm_name: rhel9-vm-demo
+  action: install
+  manifest_path: manifest-controller/rhel9-vm-cr.yaml
+  kubevirt_namespace: default
+  vm_image: registry.redhat.io/rhel9/rhel-guest-image:9.6
+  vm_cpu_cores: 2
+  vm_memory: 4Gi
+  root_password: redhat
+  user_password: redhat
+  subscription_username: XXXXX
+  subscription_password: XXXX
+  syspurpose_usage: Development/Test
+  redhat_user: redhat
+  disk_bus: virtio
+  redhat_vault_secret: secret/redhat-vm-admin

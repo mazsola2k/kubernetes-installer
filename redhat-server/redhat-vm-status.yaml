@@ -1,0 +1,24 @@
+# Tasks for getting status of RHEL9 VM in KubeVirt
+- name: Set status parameters
+  ansible.builtin.set_fact:
+    vm_name: "{{ vm_name | default('rhel9-vm') }}"
+    vm_namespace: "{{ vm_namespace | default('default') }}"
+
+- name: Get RHEL9 VM status
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ vm_name }}"
+    namespace: "{{ vm_namespace }}"
+  register: vm_status
+
+- name: Display VM deployment status
+  ansible.builtin.debug:
+    msg: |
+      {% if vm_status.resources | length == 0 %}
+      VM '{{ vm_name }}' is NOT deployed (not found)
+      {% elif vm_status.resources[0].status.phase is defined %}
+      VM '{{ vm_name }}' is DEPLOYED. Status: {{ vm_status.resources[0].status.phase }}
+      {% else %}
+      VM '{{ vm_name }}' found, but status unknown
+      {% endif %}

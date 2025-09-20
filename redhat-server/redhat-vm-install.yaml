@@ -1,0 +1,292 @@
+---
+- name: Show instructions for Red Hat subscription credentials
+  ansible.builtin.debug:
+    msg:
+      - "To enable Red Hat subscription and yum package manager in the VM, set your credentials as environment variables before running this playbook:"
+      - "  export subscription_username='<your-rh-subscription-username>'"
+      - "  export subscription_password='<your-rh-subscription-password>'"
+      - "These will be passed to the VM for registration."
+
+- name: Set subscription credentials from environment
+  ansible.builtin.set_fact:
+    subscription_username: "{{ lookup('env', 'subscription_username') | default(subscription_username | default('XXXXX')) }}"
+    subscription_password: "{{ lookup('env', 'subscription_password') | default(subscription_password | default('XXXX')) }}"
+- name: Set storage_dir default
+  ansible.builtin.set_fact:
+    storage_dir: "{{ storage_dir | default('./storage') }}"
+- name: Debug input variables
+  debug:
+    msg:
+
+
+      - "Creating RHEL9 VM with the following spec:"
+
+- name: Ensure port-forward script exists and is executable
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/library/start_portforward.sh"
+  register: portforward_script_stat
+
+- name: Fail if port-forward script is missing or not executable
+  ansible.builtin.fail:
+    msg: "Port-forward script is missing or not executable: {{ playbook_dir }}/library/start_portforward.sh"
+  when: not portforward_script_stat.stat.exists or not portforward_script_stat.stat.mode|int is search('7')
+
+- name: Port-forward Vault service for local access
+  ansible.builtin.shell: |
+    ./library/start_portforward.sh vault 8200 default /tmp/vault-portforward.log /tmp/vault-portforward.pid
+    sleep 5
+  async: 10
+  poll: 0
+  register: port_forward_job
+
+- name: Show Vault port-forward log for troubleshooting
+  ansible.builtin.shell: cat /tmp/vault-portforward.log || true
+  register: vault_portforward_log
+  changed_when: false
+  ignore_errors: true
+  tags: always
+
+- name: Display Vault port-forward log output
+  ansible.builtin.debug:
+    var: vault_portforward_log.stdout
+  tags: always
+
+- name: Wait for Vault API to be reachable on localhost:8200
+  ansible.builtin.wait_for:
+    host: localhost
+    port: 8200
+    delay: 2
+    timeout: 30
+    state: started
+  tags: always
+
+- name: Set Vault environment variables for Ansible and CLI
+  ansible.builtin.set_fact:
+    vault_env:
+      VAULT_ADDR: "http://localhost:8200"
+      VAULT_TOKEN: "{{ lookup('file', '/root/.vault-token') | trim }}"
+  tags: always
+
+- name: Vault CLI login with token from /root/.vault-token
+  ansible.builtin.shell: |
+    export VAULT_ADDR="http://localhost:8200"
+    vault login $(cat /root/.vault-token)
+  environment: "{{ vault_env }}"
+  register: vault_cli_login
+  changed_when: false
+  failed_when: vault_cli_login.rc != 0 or 'Success! You are now authenticated' not in vault_cli_login.stdout
+  tags: always
+
+- name: Show Vault CLI login output
+  ansible.builtin.debug:
+    var: vault_cli_login.stdout
+  tags: always
+
+- name: Ensure KV secrets engine is enabled at 'secret/'
+  ansible.builtin.shell: |
+    vault secrets enable -path=secret kv || vault secrets tune -max-lease-ttl=87600h secret/
+  environment: "{{ vault_env }}"
+  register: vault_kv_enable
+  changed_when: "'successfully enabled' in vault_kv_enable.stdout or 'Success! Tuned the mount' in vault_kv_enable.stdout"
+  failed_when: false
+  tags: always
+
+- name: Print admin password and vault secret before Vault policy
+  ansible.builtin.debug:
+    msg:
+      - "root_password={{ root_password | default('UNDEFINED') }}"
+      - "redhat_vault_secret={{ redhat_vault_secret | default('UNDEFINED') }}"
+  tags: always
+
+- name: Write Vault policy file for redhat-vm-admin-policy
+  ansible.builtin.copy:
+    dest: /tmp/redhat-vm-admin-policy.hcl
+    content: |
+      path "{{ redhat_vault_secret | default('secret/redhat-vm-admin') }}" {
+        capabilities = ["create", "update", "read", "delete", "list"]
+      }
+  tags: always
+
+- name: Write redhat-vm-admin-policy to Vault
+  ansible.builtin.shell: |
+    vault policy write redhat-vm-admin-policy /tmp/redhat-vm-admin-policy.hcl
+  environment: "{{ vault_env }}"
+  register: vault_policy_write_result
+  changed_when: vault_policy_write_result.rc == 0
+  failed_when: vault_policy_write_result.rc != 0
+  tags: always
+
+- name: Create Vault token with redhat-vm-admin-policy
+  ansible.builtin.shell: |
+    vault token create -policy=redhat-vm-admin-policy -format=json > /tmp/redhat-vm-admin-token.json
+  environment: "{{ vault_env }}"
+  register: vault_token_create_result
+  changed_when: vault_token_create_result.rc == 0
+  failed_when: vault_token_create_result.rc != 0
+  tags: always
+
+- name: Read created Vault token value
+  ansible.builtin.shell: jq -r .auth.client_token /tmp/redhat-vm-admin-token.json
+  register: redhat_vm_admin_token
+  changed_when: false
+  tags: always
+
+- name: Set Vault environment for admin token
+  ansible.builtin.set_fact:
+    redhat_vault_env:
+      VAULT_ADDR: "http://localhost:8200"
+      VAULT_TOKEN: "{{ redhat_vm_admin_token.stdout }}"
+    redhat_vm_admin_token: "{{ redhat_vm_admin_token.stdout }}"
+  tags: always
+
+- name: Write Red Hat VM admin password to Vault
+  ansible.builtin.shell: |
+    vault kv put {{ redhat_vault_secret | default('secret/redhat-vm-admin') }} password='{{ root_password | default('redhat') }}'
+  environment: "{{ redhat_vault_env }}"
+  register: vault_write_password_result
+  changed_when: "'Success! Data written' in vault_write_password_result.stdout or vault_write_password_result.rc == 0"
+  failed_when: vault_write_password_result.rc != 0
+
+- name: Set Vault environment variables for Ansible and CLI
+  ansible.builtin.set_fact:
+    vault_env:
+      VAULT_ADDR: "http://localhost:8200"
+      VAULT_TOKEN: "{{ lookup('file', '/root/.vault-token') | trim }}"
+
+- name: Write Red Hat VM admin password to Vault
+  ansible.builtin.shell: |
+    vault kv put {{ redhat_vault_secret | default('secret/redhat-vm-admin') }} password='{{ root_password | default('redhat') }}'
+  environment: "{{ vault_env }}"
+  register: vault_write_password_result
+  changed_when: "'Success! Data written' in vault_write_password_result.stdout or vault_write_password_result.rc == 0"
+  failed_when: vault_write_password_result.rc != 0
+
+- name: Build VirtualMachine definition
+  ansible.builtin.set_fact:
+    vm_definition:
+      apiVersion: kubevirt.io/v1
+      kind: VirtualMachine
+      metadata:
+        name: "{{ vm_name | default('rhel9-vm') }}"
+        namespace: "{{ kubevirt_namespace | default('default') }}"
+      spec:
+        running: true
+        template:
+          metadata:
+            labels:
+              kubevirt.io/domain: "{{ vm_name | default('rhel9-vm') }}"
+          spec:
+            domain:
+              cpu:
+                cores: "{{ vm_cpu_cores | default(2) | int }}"
+              devices:
+                disks:
+                  - name: rootdisk
+                    disk:
+                      bus: "{{ disk_bus | default('virtio') }}"
+                  - name: cloudinitdisk
+                    disk:
+                      bus: "{{ disk_bus | default('virtio') }}"
+              resources:
+                requests:
+                  memory: "{{ vm_memory | default('4Gi') }}"
+            volumes:
+              - name: rootdisk
+                containerDisk:
+                  image: "{{ vm_image | default('registry.redhat.io/rhel9/rhel-guest-image:9.6') }}"
+              - name: cloudinitdisk
+                cloudInitNoCloud:
+                  userData: |
+                    #cloud-config
+                    hostname: "{{ vm_name | default('rhel9-vm') }}"
+                    disable_root: false
+                    ssh_pwauth: true
+                    users:
+                      - name: {{ redhat_user | default('redhat') }}
+                        sudo: ALL=(ALL) NOPASSWD:ALL
+                        lock_passwd: false
+                    chpasswd:
+                      list: |
+                        root:{{ root_password | default('redhat') }}
+                        {{ redhat_user | default('redhat') }}:{{ user_password | default('redhat') }}
+                      expire: False
+                    write_files:
+                      - path: /etc/ssh/sshd_config.d/99-cloud-init.conf
+                        content: |
+                          PasswordAuthentication yes
+                          ChallengeResponseAuthentication no
+                          UsePAM yes
+                    runcmd:
+                      - systemctl reload sshd
+                      - echo "==== cloud-init runcmd starting ====" | tee -a /var/log/cloudinit-debug.log
+                      - subscription-manager register --username="{{ subscription_username | default('XXXX') }}" --password="{{ subscription_password | default('XXXX') }}" --auto-attach 2>&1 | tee -a /var/log/cloudinit-debug.log
+                      - subscription-manager syspurpose usage --set "{{ syspurpose_usage | default('Development/Test') }}" 2>&1 | tee -a /var/log/cloudinit-debug.log
+                      - subscription-manager repos --enable=rhel-9-for-x86_64-baseos-rpms --enable=rhel-9-for-x86_64-appstream-rpms 2>&1 | tee -a /var/log/cloudinit-debug.log
+                      - echo "==== cloud-init runcmd finished ====" | tee -a /var/log/cloudinit-debug.log
+
+- name: Fix cores to be integer type (ensure proper type casting)
+  ansible.builtin.set_fact:
+    vm_definition: "{{ vm_definition | combine({'spec': {'template': {'spec': {'domain': {'cpu': {'cores': vm_cpu_cores | default(2) | int}}}}}}, recursive=True) }}"
+
+- name: Create RHEL9 VM
+  kubernetes.core.k8s:
+    definition: "{{ vm_definition }}"
+    state: present
+
+
+- name: Wait for VM to be running and ready
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachine
+    name: "{{ vm_name | default('rhel9-vm') }}"
+    namespace: "{{ kubevirt_namespace | default('default') }}"
+  register: vm_status
+  until: >-
+    vm_status.resources | length > 0 and
+    vm_status.resources[0].status.printableStatus == 'Running'
+  retries: 20
+  delay: 3
+
+
+# Query VMI for IP address after VM is up
+- name: Get VMI info for IP address
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ vm_name | default('rhel9-vm') }}"
+    namespace: "{{ kubevirt_namespace | default('default') }}"
+  register: vmi_status
+
+# Display useful access and retrieval commands (must be last)
+- name: Display useful access and retrieval commands
+  ansible.builtin.debug:
+    msg:
+      - "\n\n==================== Useful Access & Retrieval Commands ===================="
+      - "Vault is initialized and unsealed (persistent mode, file storage)."
+      - "Root token is in /tmp/vault-init.json (key: .root_token)."
+      - "To port-forward for local access:"
+      - "  ./library/start_portforward.sh vault 8200 default /tmp/vault-portforward.log /tmp/vault-portforward.pid"
+      - "Then set VAULT_ADDR and use the CLI:"
+      - "  export VAULT_ADDR=http://localhost:8200"
+      - "  vault status"
+      - "  vault login <root_token>"
+      - ""
+      - "🔐 Retrieve Administrator password from Vault:"
+      - "  vault kv get -field=password {{ redhat_vault_secret | default('secret/redhat-vm-admin') }}"
+      - "  (Requires VAULT_ADDR and VAULT_TOKEN to be set)"
+      - ""
+      - "🖥️  VNC Access:"
+      - "  Direct: virtctl vnc {{ vm_name | default('rhel9-vm') }} -n {{ kubevirt_namespace | default('default') }}"
+      - "  Proxy: virtctl vnc {{ vm_name | default('rhel9-vm') }} -n {{ kubevirt_namespace | default('default') }} --proxy-only --port 5900"
+      - "  NodePort: localhost:30001 (if NodePort allowed through firewall)"
+      - ""
+      - "🛠️  Console Access:"
+      - "  Serial: virtctl console {{ vm_name | default('rhel9-vm') }} -n {{ kubevirt_namespace | default('default') }}"
+      - ""
+      - "📁 Storage Configuration:"
+      - "  System Disk: {{ storage_dir }}/{{ vm_name | default('rhel9-vm') }}-system-disk/disk.img"
+      - "  CloudInit: {{ storage_dir }}/cloudinit-{{ vm_name | default('rhel9-vm') }}.yaml"
+      - ""
+      - "🌐 VM IP Address: {{ (vmi_status.resources[0].status.interfaces[0].ipAddress if vmi_status.resources | length > 0 and vmi_status.resources[0].status.interfaces is defined and vmi_status.resources[0].status.interfaces | length > 0 and vmi_status.resources[0].status.interfaces[0].ipAddress is defined else 'Not Found') }}"
+      - " You can manage late your subscribed Redhat VM Resources - https://console.redhat.com/insights/inventory"
+      - "==========================================================================\n\n"

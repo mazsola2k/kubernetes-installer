@@ -1,0 +1,88 @@
+---
+# Red Hat Server Unified Deployment Controller
+# Usage: ansible-playbook redhat-server-unified-controller.yaml -e action=install|uninstall|status
+
+# Red Hat Server Unified Deployment Controller
+# Usage: ansible-playbook redhat-server-unified-controller.yaml -e action=install|uninstall|status
+- name: Red Hat Server Unified Deployment Controller
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Set default action and kind variables
+      ansible.builtin.set_fact:
+        action: "{{ action | default('install') }}"
+        kind: "{{ kind | default('Container') }}"
+
+    - name: Validate action parameter
+      ansible.builtin.fail:
+        msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, status"
+      when: action not in ['install', 'uninstall', 'status']
+
+
+
+    - block:
+        - name: Ensure Red Hat registry secret is present (prerequisite)
+          ansible.builtin.shell: |
+            kubectl get secret redhat-registry-secret || \
+            kubectl create secret docker-registry redhat-registry-secret \
+              --docker-server=registry.redhat.io \
+              --docker-username=${REDHAT_REGISTRY_USERNAME} \
+              --docker-password=${REDHAT_REGISTRY_TOKEN} \
+              --docker-email=${REDHAT_REGISTRY_EMAIL}
+          register: registry_secret_check
+          changed_when: false
+        - name: Execute Red Hat Server VM installation
+          ansible.builtin.include_tasks: "redhat-server/redhat-vm-install.yaml"
+      when:
+        - action == 'install'
+        - kind == 'VirtualMachine'
+
+    - block:
+        - name: Execute Red Hat Server VM uninstallation
+          ansible.builtin.include_tasks: "redhat-server/redhat-vm-uninstall.yaml"
+      when:
+        - action == 'uninstall'
+        - kind == 'VirtualMachine'
+
+    - block:
+        - name: Execute Red Hat Server VM status check
+          ansible.builtin.include_tasks: "redhat-server/redhat-vm-status.yaml"
+      when:
+        - action == 'status'
+        - kind == 'VirtualMachine'
+
+
+    - block:
+        - name: Ensure Red Hat registry secret is present (prerequisite)
+          ansible.builtin.shell: |
+            kubectl get secret redhat-registry-secret || \
+            kubectl create secret docker-registry redhat-registry-secret \
+              --docker-server=registry.redhat.io \
+              --docker-username=${REDHAT_REGISTRY_USERNAME} \
+              --docker-password=${REDHAT_REGISTRY_TOKEN} \
+              --docker-email=${REDHAT_REGISTRY_EMAIL}
+          register: registry_secret_check
+          changed_when: false
+        - name: Execute Red Hat Server container installation
+          ansible.builtin.include_tasks: "redhat-server/redhat-container-install.yaml"
+      when:
+        - action == 'install'
+        - kind == 'Container'
+
+    - block:
+        - name: Execute Red Hat Server container uninstallation
+          ansible.builtin.include_tasks: "redhat-server/redhat-container-uninstall.yaml"
+      when:
+        - action == 'uninstall'
+        - kind == 'Container'
+
+    - block:
+        - name: Execute Red Hat Server container status check
+          ansible.builtin.include_tasks: "redhat-server/redhat-container-status.yaml"
+      when:
+        - action == 'status'
+        - kind == 'Container'
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: "✅ Red Hat Server {{ kind }} {{ action | upper }} completed successfully!"

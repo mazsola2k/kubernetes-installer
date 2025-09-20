@@ -1,0 +1,56 @@
+---
+# Playbook to create and configure Red Hat registry secret for KubeVirt VM image pulls
+# Usage:
+#   export redhat_registry_email=<your-email>
+#   export redhat_registry_token=<your-api-token>
+#   ansible-playbook redhat-server/redhat-registry.yaml
+
+- name: Create Red Hat registry secret and patch default serviceaccount
+  hosts: localhost
+  gather_facts: no
+  vars:
+    registry_server: "registry.redhat.io"
+    registry_username: "{{ lookup('env', 'redhat_registry_username') }}"
+    registry_email: "{{ lookup('env', 'redhat_registry_email') }}"
+    registry_token: "{{ lookup('env', 'redhat_registry_token') }}"
+    registry_secret_name: "redhat-registry-secret"
+  tasks:
+    - name: Show instructions for obtaining Red Hat registry credentials
+      ansible.builtin.debug:
+        msg:
+          - "To obtain a Red Hat registry token, visit:"
+          - "  https://access.redhat.com/articles/RegistryAuthentication"
+          - "  Create a repository service account: https://access.redhat.com/terms-based-registry/"
+          - "  https://access.redhat.com/terms-based-registry/token/serviceaccount/docker-login"
+          - "  You can manage your subscribed VM resources here: https://console.redhat.com/insights/inventory"
+          - "Set your credentials as environment variables before running this playbook:"
+          - "  export redhat_registry_username='accountnumber|serviceaccount'"
+          - "  export redhat_registry_email=your-email"
+          - "  export redhat_registry_token=your-api-token"
+
+    - name: Fail if registry credentials are not set
+      ansible.builtin.fail:
+        msg: "redhat_registry_username, redhat_registry_email, and redhat_registry_token environment variables must be set."
+      when: registry_username == '' or registry_email == '' or registry_token == ''
+
+    - name: Create docker-registry secret for Red Hat registry
+      ansible.builtin.shell: |
+        kubectl create secret docker-registry {{ registry_secret_name }} \
+          --docker-server={{ registry_server }} \
+          --docker-username=${redhat_registry_username} \
+          --docker-password=${redhat_registry_token} \
+          --docker-email=${redhat_registry_email} || true
+      register: create_secret_result
+      changed_when: "'created' in create_secret_result.stdout or 'already exists' in create_secret_result.stdout"
+
+    - name: Patch default serviceaccount to use registry secret
+      ansible.builtin.shell: |
+        kubectl patch serviceaccount default -p '{"imagePullSecrets":[{"name":"{{ registry_secret_name }}"}]}'
+      register: patch_sa_result
+      changed_when: patch_sa_result.rc == 0
+
+    - name: Show completion message
+      ansible.builtin.debug:
+        msg:
+          - "✅ Red Hat registry secret '{{ registry_secret_name }}' created and default serviceaccount patched."
+          - "You can now pull Red Hat images in your manifests/playbooks."
