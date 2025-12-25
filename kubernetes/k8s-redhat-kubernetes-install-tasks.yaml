@@ -88,6 +88,26 @@
     replace: ''
   when: ansible_swaptotal_mb | int > 0
 
+- name: Disable systemd zram generator
+  ansible.builtin.copy:
+    dest: /etc/systemd/zram-generator.conf
+    content: |
+      [zram0]
+      enabled=no
+    mode: '0644'
+
+- name: Stop and disable zram swap devices
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - dev-zram0.swap
+    - systemd-zram-setup@zram0.service
+  register: zram_units_disabled
+  failed_when: false
+
 - name: Set hostname
   ansible.builtin.hostname:
     name: "{{ k8s_hostname }}"
@@ -109,23 +129,11 @@
     repo_gpgcheck: yes
     gpgkey: https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
 
+
 # Install container runtime (containerd)
-- name: Install required packages for Docker repo
-  ansible.builtin.dnf:
-    name:
-      - yum-utils
-      - device-mapper-persistent-data
-      - lvm2
-    state: present
-
-- name: Add Docker's official repository
-  ansible.builtin.command: yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-  args:
-    creates: /etc/yum.repos.d/docker-ce.repo
-
 - name: Install containerd
   ansible.builtin.dnf:
-    name: containerd.io
+    name: containerd
     state: present
   register: containerd_install
 

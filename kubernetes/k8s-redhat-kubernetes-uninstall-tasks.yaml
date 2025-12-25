@@ -56,7 +56,7 @@
 
 - name: Show kubeadm reset output
   ansible.builtin.debug:
-    var: kubeadm_reset.stdout_lines
+    msg: "{{ kubeadm_reset.stdout_lines | default(['kubeadm reset was skipped (binary missing)']) }}"
   when: kubeadm_reset is defined
 
 - name: Stop kubelet if present
@@ -73,6 +73,7 @@
     done
   register: runtime_service
   changed_when: false
+  failed_when: false
 
 - name: Stop container runtime (if detected)
   ansible.builtin.systemd:
