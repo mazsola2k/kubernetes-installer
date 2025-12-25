@@ -123,11 +123,11 @@
   ansible.builtin.yum_repository:
     name: kubernetes
     description: Kubernetes
-    baseurl: "https://pkgs.k8s.io/core:/stable:/v1.30/rpm/"
+    baseurl: "https://pkgs.k8s.io/core:/stable:/v1.35/rpm/"
     enabled: yes
     gpgcheck: yes
     repo_gpgcheck: yes
-    gpgkey: https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+    gpgkey: https://pkgs.k8s.io/core:/stable:/v1.35/rpm/repodata/repomd.xml.key
 
 
 # Install container runtime (containerd)
@@ -241,6 +241,24 @@
     chown $(id -u):$(id -g) /root/.kube/config
   args:
     creates: /root/.kube/config
+
+- name: Configure kubectl for the Ansible user
+  become: true
+  vars:
+    kubeconfig_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    kubeconfig_home: "{{ ((ansible_env.SUDO_USER | default(ansible_user_id)) == 'root') | ternary('/root', '/home/' ~ (ansible_env.SUDO_USER | default(ansible_user_id))) }}"
+  ansible.builtin.shell: |
+    mkdir -p "{{ kubeconfig_home }}/.kube"
+    cp /etc/kubernetes/admin.conf "{{ kubeconfig_home }}/.kube/config"
+    chown {{ kubeconfig_user }}:{{ kubeconfig_user }} "{{ kubeconfig_home }}/.kube/config"
+  when: kubeconfig_user != 'root'
+
+- name: Allow scheduling on control-plane node (single-node)
+  ansible.builtin.command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+  register: early_taint_remove
+  failed_when: false
+  changed_when: "'already has' not in early_taint_remove.stderr"
+  when: kubeadm_init.changed
 
 - name: Wait for API server to be ready
   ansible.builtin.uri:

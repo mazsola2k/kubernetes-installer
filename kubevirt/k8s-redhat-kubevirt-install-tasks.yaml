@@ -30,10 +30,26 @@
     name: python3-pip
     state: present
 
-- name: Ensure kubernetes Python package is installed
+- name: Ensure Python venv tooling is installed
+  ansible.builtin.package:
+    name: python3-virtualenv
+    state: present
+
+- name: Create venv for kubevirt Ansible dependencies
+  ansible.builtin.command: python3 -m venv /opt/kubevirt-ansible-venv
+  args:
+    creates: /opt/kubevirt-ansible-venv/bin/python
+
+- name: Install Python deps for kubevirt tasks in venv
   ansible.builtin.pip:
-    name: kubernetes
-    executable: pip3
+    name:
+      - kubernetes==34.1.0
+      - urllib3==2.3.0
+    virtualenv: /opt/kubevirt-ansible-venv
+
+- name: Use kubevirt venv as interpreter for subsequent tasks
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: /opt/kubevirt-ansible-venv/bin/python
 
 - name: Ensure kubectl is installed
   ansible.builtin.command: which kubectl
