@@ -150,6 +150,13 @@
     replace: 'SystemdCgroup = true'
   register: containerd_config_change
 
+- name: Set containerd CNI bin_dir to /opt/cni/bin (where Calico installs plugins)
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: 'bin_dir = "/usr/libexec/cni"'
+    replace: 'bin_dir = "/opt/cni/bin"'
+  register: containerd_cni_bin_change
+
 - name: Enable and start containerd
   ansible.builtin.systemd:
     name: containerd
@@ -161,7 +168,7 @@
   ansible.builtin.systemd:
     name: containerd
     state: restarted
-  when: containerd_install.changed or containerd_config_generate.changed or containerd_config_change.changed
+  when: containerd_install.changed or containerd_config_generate.changed or containerd_config_change.changed or containerd_cni_bin_change.changed
 
 - name: Wait for containerd to be ready
   ansible.builtin.pause:
@@ -181,6 +188,45 @@
     name: kubelet
     enabled: yes
     state: started
+
+# If a previous init left the control plane unhealthy, reset and wipe stale state so reruns are clean.
+- name: Check if kubeadm admin.conf already exists
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf
+
+- name: Probe existing API server health
+  ansible.builtin.uri:
+    url: "https://{{ ansible_default_ipv4.address }}:6443/healthz"
+    method: GET
+    validate_certs: no
+  register: existing_api_health
+  failed_when: false
+  when: admin_conf.stat.exists
+
+- name: Mark cluster for reset when API is not healthy
+  ansible.builtin.set_fact:
+    kubeadm_reset_required: true
+  when: admin_conf.stat.exists and existing_api_health.status | default(0) != 200
+
+- name: Reset kubeadm and remove stale control plane state
+  ansible.builtin.command: kubeadm reset -f
+  when: kubeadm_reset_required | default(false)
+
+- name: Remove residual Kubernetes manifests, configs, and etcd data after reset
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/kubernetes/manifests
+    - /etc/kubernetes/pki
+    - /etc/kubernetes/admin.conf
+    - /etc/kubernetes/kubelet.conf
+    - /etc/kubernetes/controller-manager.conf
+    - /etc/kubernetes/scheduler.conf
+    - /etc/kubernetes/bootstrap-kubelet.conf
+    - /var/lib/etcd
+  when: kubeadm_reset_required | default(false)
 
 - name: Initialize Kubernetes cluster (single-node)
   ansible.builtin.command: kubeadm init --pod-network-cidr=192.168.0.0/16
