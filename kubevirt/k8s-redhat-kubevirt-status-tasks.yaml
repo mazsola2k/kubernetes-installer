@@ -34,8 +34,8 @@
   ansible.builtin.debug:
     msg:
       - "=== KubeVirt Status Summary ==="
-      - "Namespace: {{ 'PRESENT' if kubevirt_ns.resources | length > 0 else 'MISSING' }}"
-      - "CustomResource: {{ 'DEPLOYED' if kubevirt_cr.resources | length > 0 else 'MISSING' }}"
-      - "Phase: {{ kubevirt_cr.resources[0].status.phase | default('Unknown') if kubevirt_cr.resources | length > 0 else 'N/A' }}"
+      - "Namespace: {{ 'PRESENT' if (kubevirt_ns.resources | default([]) | length > 0) else 'MISSING' }}"
+      - "CustomResource: {{ 'DEPLOYED' if (kubevirt_cr.resources | default([]) | length > 0) else 'MISSING' }}"
+      - "Phase: {{ kubevirt_cr.resources[0].status.phase | default('Unknown') if (kubevirt_cr.resources | default([]) | length > 0) else 'N/A' }}"
       - "Pods:"
       - "{{ kubevirt_pods.stdout_lines | default(['No pods found']) }}"

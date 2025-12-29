@@ -6,6 +6,7 @@
   vars:
     action: install  # set to 'install', 'uninstall', or 'status'
     vault_namespace: "default"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
   tasks:
     - name: Include install tasks
       include_tasks: hashicorp-vault-service/hashicorp-vault-service-install.yaml

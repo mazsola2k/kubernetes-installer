@@ -29,50 +29,42 @@
     msg: "Port-forward script is missing or not executable: {{ playbook_dir }}/library/start_portforward.sh"
   when: not portforward_script_stat.stat.exists or not portforward_script_stat.stat.mode|int is search('7')
 
-- name: Port-forward Vault service for local access
-  ansible.builtin.shell: |
-    ./library/start_portforward.sh vault 8200 default /tmp/vault-portforward.log /tmp/vault-portforward.pid
-    sleep 5
-  async: 10
-  poll: 0
-  register: port_forward_job
-
-- name: Show Vault port-forward log for troubleshooting
-  ansible.builtin.shell: cat /tmp/vault-portforward.log || true
-  register: vault_portforward_log
+- name: Kill any existing Vault port-forward processes
+  ansible.builtin.shell: pkill -f 'kubectl port-forward.*vault.*8200' || true
   changed_when: false
   ignore_errors: true
+
+- name: Read Vault root token from file
+  ansible.builtin.shell: sudo cat /root/.vault-token
+  register: vault_root_token
+  changed_when: false
   tags: always
 
-- name: Display Vault port-forward log output
-  ansible.builtin.debug:
-    var: vault_portforward_log.stdout
-  tags: always
-
-- name: Wait for Vault API to be reachable on localhost:8200
-  ansible.builtin.wait_for:
-    host: localhost
-    port: 8200
-    delay: 2
-    timeout: 30
-    state: started
-  tags: always
-
-
-# Set Vault environment variables for CLI (token from /root/.vault-token)
-- name: Set Vault environment variables for Ansible and CLI
+- name: Set Vault environment variables (using kubectl exec into vault pod)
   ansible.builtin.set_fact:
     vault_env:
-      VAULT_ADDR: "http://localhost:8200"
-      VAULT_TOKEN: "{{ lookup('file', '/root/.vault-token') | trim }}"
+      VAULT_ADDR: "http://127.0.0.1:8200"
+      VAULT_TOKEN: "{{ vault_root_token.stdout | trim }}"
   tags: always
 
-# Authenticate to Vault CLI using token from /root/.vault-token
-- name: Vault CLI login with token from /root/.vault-token
+- name: Test Vault access via kubectl exec
   ansible.builtin.shell: |
-    export VAULT_ADDR="http://localhost:8200"
-    vault login $(cat /root/.vault-token)
-  environment: "{{ vault_env }}"
+    kubectl exec -n default vault-0 -- vault status
+  environment:
+    VAULT_ADDR: "http://127.0.0.1:8200"
+  register: vault_status_test
+  changed_when: false
+  tags: always
+
+- name: Show Vault status from pod
+  ansible.builtin.debug:
+    var: vault_status_test.stdout_lines
+  tags: always
+
+# Authenticate to Vault CLI using kubectl exec
+- name: Vault CLI login via kubectl exec
+  ansible.builtin.shell: |
+    kubectl exec -n default vault-0 -- vault login {{ vault_root_token.stdout | trim }}
   register: vault_cli_login
   changed_when: false
   failed_when: vault_cli_login.rc != 0 or 'Success! You are now authenticated' not in vault_cli_login.stdout
@@ -86,8 +78,7 @@
 # Ensure KV secrets engine is enabled at 'secret/'
 - name: Ensure KV secrets engine is enabled at 'secret/'
   ansible.builtin.shell: |
-    vault secrets enable -path=secret kv || vault secrets tune -max-lease-ttl=87600h secret/
-  environment: "{{ vault_env }}"
+    kubectl exec -n default vault-0 -- sh -c 'vault secrets enable -path=secret kv || vault secrets tune -max-lease-ttl=87600h secret/'
   register: vault_kv_enable
   changed_when: "'successfully enabled' in vault_kv_enable.stdout or 'Success! Tuned the mount' in vault_kv_enable.stdout"
   failed_when: false
@@ -110,21 +101,25 @@
       }
   tags: always
 
-# Apply the Vault policy for Windows Server 2025 admin secret
-- name: Write win2025-admin-policy to Vault
+# Copy policy file to Vault pod and apply
+- name: Copy policy file to Vault pod
   ansible.builtin.shell: |
-    vault policy write win2025-admin-policy /tmp/win2025-admin-policy.hcl
-  environment: "{{ vault_env }}"
+    kubectl cp /tmp/win2025-admin-policy.hcl default/vault-0:/tmp/win2025-admin-policy.hcl
+  tags: always
+
+# Apply the Vault policy for Windows Server 2025 admin secret
+- name: Write win2025-admin-policy to Vault via kubectl exec
+  ansible.builtin.shell: |
+    kubectl exec -n default vault-0 -- vault policy write win2025-admin-policy /tmp/win2025-admin-policy.hcl
   register: vault_policy_write_result
   changed_when: vault_policy_write_result.rc == 0
   failed_when: vault_policy_write_result.rc != 0
   tags: always
 
 # Create a Vault token with the win2025-admin-policy
-- name: Create Vault token with win2025-admin-policy
+- name: Create Vault token with win2025-admin-policy via kubectl exec
   ansible.builtin.shell: |
-    vault token create -policy=win2025-admin-policy -format=json > /tmp/win2025-admin-token.json
-  environment: "{{ vault_env }}"
+    kubectl exec -n default vault-0 -- vault token create -policy=win2025-admin-policy -format=json > /tmp/win2025-admin-token.json
   register: vault_token_create_result
   changed_when: vault_token_create_result.rc == 0
   failed_when: vault_token_create_result.rc != 0
@@ -148,10 +143,9 @@
   tags: always
 
 # Write the admin password to Vault at the specified path
-- name: Write admin password to Vault
+- name: Write admin password to Vault via kubectl exec
   ansible.builtin.shell: |
-    vault kv put {{ windows_vault_secret }} password='{{ windows_admin_password }}'
-  environment: "{{ win2025_vault_env }}"
+    kubectl exec -n default vault-0 -- vault kv put {{ windows_vault_secret }} password='{{ windows_admin_password }}'
   register: vault_write_password_result
   changed_when: "'Success! Data written' in vault_write_password_result.stdout or vault_write_password_result.rc == 0"
   failed_when: vault_write_password_result.rc != 0

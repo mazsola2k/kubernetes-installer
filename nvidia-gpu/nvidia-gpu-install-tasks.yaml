@@ -1,0 +1,128 @@
+---
+# Install NVIDIA GPU Support for Kubernetes
+
+# Verify prerequisites
+- name: Verify NVIDIA GPU is present
+  shell: lspci | grep -i nvidia
+  register: nvidia_gpu_check
+  changed_when: false
+  failed_when: nvidia_gpu_check.rc != 0
+  
+- name: Display detected NVIDIA GPU
+  debug:
+    msg: "{{ nvidia_gpu_check.stdout_lines }}"
+    
+- name: Verify NVIDIA drivers are installed
+  command: nvidia-smi
+  register: nvidia_smi_check
+  changed_when: false
+  failed_when: nvidia_smi_check.rc != 0
+  
+- name: Display NVIDIA driver version
+  debug:
+    msg: "{{ nvidia_smi_check.stdout_lines | select('search', 'Driver Version') | list }}"
+
+# Install NVIDIA Container Toolkit
+- name: Add NVIDIA container toolkit repository
+  get_url:
+    url: https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo
+    dest: /etc/yum.repos.d/nvidia-container-toolkit.repo
+    mode: '0644'
+
+- name: Remove conflicting Fedora package if present
+  dnf:
+    name: golang-github-nvidia-container-toolkit
+    state: absent
+  ignore_errors: yes
+
+- name: Install NVIDIA container toolkit
+  dnf:
+    name: nvidia-container-toolkit
+    state: present
+    update_cache: yes
+
+- name: Create containerd config directory
+  file:
+    path: "{{ containerd_config_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Configure containerd to use NVIDIA runtime
+  command: nvidia-ctk runtime configure --runtime=containerd --set-as-default
+  register: nvidia_ctk_config
+  changed_when: "'Wrote updated config' in nvidia_ctk_config.stdout"
+
+- name: Display containerd configuration result
+  debug:
+    msg: "{{ nvidia_ctk_config.stdout_lines }}"
+
+- name: Create CDI directory
+  file:
+    path: /etc/cdi
+    state: directory
+    mode: '0755'
+
+- name: Generate NVIDIA CDI specification
+  command: nvidia-ctk cdi generate --output={{ cdi_config_path }}
+  register: cdi_generate
+  changed_when: "'Generated CDI spec' in cdi_generate.stdout"
+
+- name: Restart containerd service
+  systemd:
+    name: containerd
+    state: restarted
+    enabled: yes
+
+- name: Wait for containerd to be ready
+  wait_for:
+    timeout: 10
+
+- name: Restart kubelet service
+  systemd:
+    name: kubelet
+    state: restarted
+    enabled: yes
+  when: ansible_facts.services['kubelet.service'] is defined
+
+- name: Wait for kubelet to be ready
+  wait_for:
+    timeout: 15
+
+# Deploy NVIDIA Device Plugin for Kubernetes
+- name: Check if NVIDIA device plugin is already deployed
+  command: kubectl get daemonset -n kube-system nvidia-device-plugin-daemonset
+  register: device_plugin_check
+  changed_when: false
+  failed_when: false
+
+- name: Deploy NVIDIA device plugin DaemonSet
+  command: >
+    kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/{{ nvidia_device_plugin_version }}/deployments/static/nvidia-device-plugin.yml
+  register: device_plugin_deploy
+  changed_when: "'created' in device_plugin_deploy.stdout or 'configured' in device_plugin_deploy.stdout"
+  when: device_plugin_check.rc != 0
+
+- name: Wait for NVIDIA device plugin to be ready
+  command: kubectl wait --for=condition=ready --timeout=60s pod -n kube-system -l name=nvidia-device-plugin-ds
+  register: plugin_ready
+  changed_when: false
+  retries: 3
+  delay: 10
+  until: plugin_ready.rc == 0
+
+- name: Verify GPU capacity is reported by Kubernetes
+  shell: kubectl get nodes -o json | jq '.items[].status.capacity | select(.["nvidia.com/gpu"] != null)'
+  register: gpu_capacity
+  changed_when: false
+
+- name: Display GPU capacity
+  debug:
+    msg: "{{ gpu_capacity.stdout }}"
+  when: gpu_capacity.stdout != ""
+
+- name: Verify setup is complete
+  assert:
+    that:
+      - gpu_capacity.stdout != ""
+    fail_msg: "GPU capacity not detected in Kubernetes. Setup may have failed."
+    success_msg: "NVIDIA GPU support successfully configured!"

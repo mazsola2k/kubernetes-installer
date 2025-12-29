@@ -1,0 +1,64 @@
+---
+- name: Test Vault Access from Ansible
+  hosts: localhost
+  gather_facts: yes
+  
+  tasks:
+  - name: Kill any existing Vault port-forward processes
+    ansible.builtin.shell: pkill -f 'kubectl port-forward.*vault.*8200' || true
+    changed_when: false
+    ignore_errors: true
+
+  - name: Port-forward Vault service for local access
+    ansible.builtin.shell: |
+      nohup kubectl port-forward -n default pod/vault-0 8200:8200 > /tmp/vault-portforward.log 2>&1 &
+      echo $! > /tmp/vault-portforward.pid
+      sleep 5
+    register: port_forward_start
+
+  - name: Display port-forward log
+    ansible.builtin.shell: cat /tmp/vault-portforward.log || echo "No log file yet"
+    register: pf_log
+    changed_when: false
+    
+  - name: Show port-forward output
+    ansible.builtin.debug:
+      var: pf_log.stdout_lines
+
+  - name: Wait for Vault API to be available
+    ansible.builtin.wait_for:
+      host: localhost
+      port: 8200
+      delay: 2
+      timeout: 30
+      state: started
+
+  - name: Read Vault token
+    ansible.builtin.shell: sudo cat /root/.vault-token
+    register: vault_token_content
+    changed_when: false
+
+  - name: Set Vault environment variables
+    ansible.builtin.set_fact:
+      vault_env:
+        VAULT_ADDR: "http://localhost:8200"
+        VAULT_TOKEN: "{{ vault_token_content.stdout }}"
+
+  - name: Test Vault CLI login
+    ansible.builtin.shell: vault login {{ vault_env.VAULT_TOKEN }}
+    environment: "{{ vault_env }}"
+    register: vault_login
+    failed_when: "'Success!' not in vault_login.stdout"
+
+  - name: Show Vault login result
+    ansible.builtin.debug:
+      var: vault_login.stdout_lines
+
+  - name: Test Vault status command
+    ansible.builtin.shell: vault status
+    environment: "{{ vault_env }}"
+    register: vault_status
+
+  - name: Show Vault status
+    ansible.builtin.debug:
+      var: vault_status.stdout_lines

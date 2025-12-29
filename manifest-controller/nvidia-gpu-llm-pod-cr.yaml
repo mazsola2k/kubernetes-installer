@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-llm-pod
+spec:
+  restartPolicy: Never
+  containers:
+    - name: ollama-llm
+      image: ollama/ollama:latest
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -e
+          echo "=== Starting Ollama server ==="
+          ollama serve &
+          OLLAMA_PID=$!
+          
+          echo "Waiting for Ollama to start..."
+          sleep 5
+          
+          echo ""
+          echo "=== GPU Detection ==="
+          nvidia-smi -L
+          echo ""
+          
+          echo "=== Pulling TinyLlama model (1.1B parameters) ==="
+          ollama pull tinyllama
+          
+          echo ""
+          echo "=== Running sample prompt ==="
+          echo "Prompt: 'Explain what is Kubernetes in one sentence.'"
+          echo ""
+          ollama run tinyllama "Explain what is Kubernetes in one sentence."
+          
+          echo ""
+          echo "=== Another prompt ==="
+          echo "Prompt: 'Write a haiku about GPU computing.'"
+          echo ""
+          ollama run tinyllama "Write a haiku about GPU computing."
+          
+          echo ""
+          echo "=== Model info ==="
+          ollama list
+          
+          echo ""
+          echo "=== Keeping container alive for interactive use ==="
+          echo "You can exec into this pod and run:"
+          echo "  ollama run tinyllama 'your prompt here'"
+          echo ""
+          
+          # Keep alive
+          wait $OLLAMA_PID
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          memory: "4Gi"
+        requests:
+          memory: "2Gi"
+      env:
+        - name: OLLAMA_HOST
+          value: "0.0.0.0:11434"

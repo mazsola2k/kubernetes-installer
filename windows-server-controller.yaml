@@ -13,7 +13,7 @@
     windows_admin_password: "{{ admin_password | default('SecureP@ssw0rd!') }}"
     windows_vault_secret: "{{ vault_secret | default('secret/data/windows-server-2025/admin', true) }}"
     windows_product_key: "{{ product_key | default('') }}"
-    ansible_python_interpreter: /usr/bin/python3
+    ansible_python_interpreter: "{{ playbook_dir }}/.venv/bin/python3"
 
   tasks:
     - name: Set default variables

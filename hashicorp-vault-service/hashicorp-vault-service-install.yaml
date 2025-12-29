@@ -1,10 +1,24 @@
 
 # Install HashiCorp Vault via Helm (single-node, dev/test)
+- name: Ensure kubernetes Python library is installed
+  ansible.builtin.pip:
+    name: kubernetes
+    state: present
+    executable: "{{ ansible_playbook_python | replace('/bin/python', '/bin/pip') }}"
+
 - name: Install Helm if not present
   ansible.builtin.shell: |
     curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
   args:
     creates: /usr/local/bin/helm
+  become: true
+
+- name: Install Vault CLI if not present
+  ansible.builtin.shell: |
+    wget -O- https://releases.hashicorp.com/vault/1.15.2/vault_1.15.2_linux_amd64.zip | gunzip > /usr/local/bin/vault
+    chmod +x /usr/local/bin/vault
+  args:
+    creates: /usr/local/bin/vault
   become: true
 
 - name: Add HashiCorp Helm repo
@@ -132,39 +146,42 @@
   changed_when: vault_pod_delete.rc == 0
   failed_when: vault_pod_delete.rc not in [0, 1]
 
-- name: Wait for Vault pod to be running (not ready)
+- name: Wait for Vault pod to be running
   kubernetes.core.k8s_info:
     api_version: v1
     kind: Pod
     namespace: "{{ vault_namespace }}"
     label_selectors:
       - "app.kubernetes.io/name=vault"
-    wait: true
-    wait_condition:
-      type: PodScheduled
-      status: "True"
-    wait_timeout: 300
+  register: vault_pod_info
+  until: vault_pod_info.resources | length > 0 and vault_pod_info.resources[0].status.phase == "Running"
+  retries: 30
+  delay: 10
 
+- name: Additional wait for Vault to stabilize
+  ansible.builtin.pause:
+    seconds: 5
 
 - name: Port-forward Vault service for initialization
   ansible.builtin.shell: |
-    ./library/start_portforward.sh vault 8200 {{ vault_namespace }} /tmp/vault-portforward.log /tmp/vault-portforward.pid
-    sleep 5
-  async: 10
-  poll: 0
-  register: port_forward_job
+    nohup kubectl port-forward -n {{ vault_namespace }} svc/vault 8200:8200 > /tmp/vault-portforward.log 2>&1 &
+    echo $! > /tmp/vault-portforward.pid
+    sleep 10
+  register: port_forward_start
 
 - name: Initialize Vault
   ansible.builtin.shell: |
     rm -f /root/vault-init.json
     export VAULT_ADDR=http://localhost:8200
     vault operator init -key-shares=1 -key-threshold=1 -format=json > /root/vault-init.json
+    chmod 644 /root/vault-init.json
   environment:
     VAULT_ADDR: http://localhost:8200
   register: vault_init
   until: vault_init.rc == 0
   retries: 10
   delay: 5
+  become: true
 
 - name: Unseal Vault
   ansible.builtin.shell: |
@@ -172,6 +189,7 @@
     vault operator unseal $(jq -r '.unseal_keys_b64[0]' /root/vault-init.json)
   environment:
     VAULT_ADDR: http://localhost:8200
+  become: true
   register: vault_unseal
   until: vault_unseal.rc == 0
   retries: 5
@@ -205,8 +223,8 @@
       - "Root token is in /root/vault-init.json (key: .root_token)."
       - "To port-forward for local access:"
       - "  ./library/start_portforward.sh vault 8200 {{ vault_namespace }} /tmp/vault-portforward.log /tmp/vault-portforward.pid"
-      - "To use the Vault CLI as root user, run:"
-      - "  export VAULT_TOKEN=$(jq -r '.root_token' /root/vault-init.json)"
+      - "To use the Vault CLI, run:"
+      - "  export VAULT_TOKEN=$(sudo jq -r '.root_token' /root/vault-init.json)"
       - "  export VAULT_ADDR=http://vault.default.svc.cluster.local:8200"
       - "  export VAULT_ADDR=http://localhost:8200"
       - "  vault status"

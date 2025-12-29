@@ -1,0 +1,52 @@
+---
+# Ansible Playbook: NVIDIA GPU Controller for Kubernetes
+# This playbook manages NVIDIA GPU support in a Kubernetes cluster on Fedora
+# Prerequisites: 
+#   - NVIDIA GPU hardware installed
+#   - NVIDIA drivers already installed on the host
+#   - Kubernetes cluster running with containerd runtime
+#
+# Usage: 
+#   ansible-playbook nvidia-gpu-controller.yaml --tags install
+#   ansible-playbook nvidia-gpu-controller.yaml --tags status
+#   ansible-playbook nvidia-gpu-controller.yaml --tags uninstall
+
+- name: NVIDIA GPU Controller for Kubernetes
+  hosts: localhost
+  connection: local
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    nvidia_device_plugin_version: "v0.16.2"
+    containerd_config_dir: "/etc/containerd/conf.d"
+    cdi_config_path: "/etc/cdi/nvidia.yaml"
+    action: "{{ gpu_action | default('install') }}"
+    
+  tasks:
+    - name: Verify prerequisites
+      block:
+        - name: Check if running on supported OS
+          assert:
+            that:
+              - ansible_distribution == "Fedora"
+            fail_msg: "This playbook is designed for Fedora. Detected: {{ ansible_distribution }}"
+            success_msg: "Running on {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Execute NVIDIA GPU installation
+      include_tasks: nvidia-gpu/nvidia-gpu-install-tasks.yaml
+      when: action == 'install'
+      tags:
+        - install
+
+    - name: Execute NVIDIA GPU status check
+      include_tasks: nvidia-gpu/nvidia-gpu-status-tasks.yaml
+      when: action == 'status'
+      tags:
+        - status
+
+    - name: Execute NVIDIA GPU uninstall
+      include_tasks: nvidia-gpu/nvidia-gpu-uninstall-tasks.yaml
+      when: action == 'uninstall'
+      tags:
+        - uninstall

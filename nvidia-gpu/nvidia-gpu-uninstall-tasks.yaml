@@ -1,0 +1,71 @@
+---
+# Uninstall NVIDIA GPU support from Kubernetes
+
+# Check for GPU pods before uninstalling
+- name: Check if any GPU pods are running
+  shell: kubectl get pods -A -o json | jq -r '.items[] | select(.spec.containers[]?.resources.limits."nvidia.com/gpu" != null) | "\(.metadata.namespace)/\(.metadata.name)"'
+  register: gpu_pods_check
+  changed_when: false
+  failed_when: false
+
+- name: Display warning about GPU pods
+  debug:
+    msg: "WARNING: The following GPU pods are running and will lose GPU access: {{ gpu_pods_check.stdout_lines }}"
+  when: gpu_pods_check.stdout_lines | length > 0
+
+- name: Delete GPU pods before uninstall
+  shell: kubectl get pods -A -o json | jq -r '.items[] | select(.spec.containers[]?.resources.limits."nvidia.com/gpu" != null) | "\(.metadata.namespace) \(.metadata.name)"' | while read ns name; do kubectl delete pod -n "$ns" "$name" --wait=false; done
+  register: gpu_pods_delete
+  changed_when: gpu_pods_delete.rc == 0
+  failed_when: false
+  when: gpu_pods_check.stdout_lines | length > 0
+
+- name: Wait for GPU pods to terminate
+  pause:
+    seconds: 5
+  when: gpu_pods_check.stdout_lines | length > 0
+
+- name: Delete NVIDIA device plugin DaemonSet
+  command: kubectl delete daemonset -n kube-system nvidia-device-plugin-daemonset
+  register: device_plugin_delete
+  changed_when: device_plugin_delete.rc == 0
+  failed_when: false
+
+- name: Remove NVIDIA CDI specification
+  file:
+    path: "{{ cdi_config_path }}"
+    state: absent
+
+- name: Remove containerd NVIDIA configuration
+  file:
+    path: "{{ containerd_config_dir }}/99-nvidia.toml"
+    state: absent
+
+- name: Restore default containerd configuration
+  command: nvidia-ctk runtime configure --runtime=containerd --restore
+  register: restore_config
+  changed_when: restore_config.rc == 0
+  failed_when: false
+  ignore_errors: yes
+
+- name: Restart containerd service
+  systemd:
+    name: containerd
+    state: restarted
+
+- name: Restart kubelet service
+  systemd:
+    name: kubelet
+    state: restarted
+  when: ansible_facts.services['kubelet.service'] is defined
+
+- name: Verify GPU capacity is removed from nodes
+  shell: kubectl get nodes -o json | jq '.items[].status.capacity | select(.["nvidia.com/gpu"] != null)'
+  register: gpu_capacity_check
+  changed_when: false
+  failed_when: false
+
+- name: Confirm uninstall complete
+  debug:
+    msg: "NVIDIA GPU support has been removed from Kubernetes"
+  when: gpu_capacity_check.stdout == ""

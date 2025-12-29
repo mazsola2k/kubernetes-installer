@@ -1,0 +1,44 @@
+---
+# Check NVIDIA GPU status in Kubernetes
+- name: Check NVIDIA driver status
+  command: nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+  register: nvidia_status
+  changed_when: false
+  failed_when: false
+
+- name: Display NVIDIA GPU status
+  debug:
+    msg: "{{ nvidia_status.stdout_lines }}"
+  when: nvidia_status.rc == 0
+
+- name: Check NVIDIA device plugin status
+  command: kubectl get pods -n kube-system -l name=nvidia-device-plugin-ds -o wide
+  register: device_plugin_status
+  changed_when: false
+  failed_when: false
+
+- name: Display device plugin status
+  debug:
+    msg: "{{ device_plugin_status.stdout_lines }}"
+  when: device_plugin_status.rc == 0
+
+- name: Check GPU capacity on nodes
+  shell: 'kubectl get nodes -o json | jq ''.items[] | {name: .metadata.name, gpu: .status.capacity["nvidia.com/gpu"]}'''
+  register: gpu_node_capacity
+  changed_when: false
+  failed_when: false
+
+- name: Display GPU capacity per node
+  debug:
+    msg: "{{ gpu_node_capacity.stdout_lines }}"
+  when: gpu_node_capacity.rc == 0
+
+- name: Check if any GPU pods are running
+  shell: kubectl get pods -A -o json | jq -r '.items[] | select(.spec.containers[]?.resources.limits."nvidia.com/gpu" != null) | "\(.metadata.namespace)/\(.metadata.name)"'
+  register: gpu_pods
+  changed_when: false
+  failed_when: false
+
+- name: Display GPU pods
+  debug:
+    msg: "{{ gpu_pods.stdout_lines if gpu_pods.stdout_lines | length > 0 else ['No pods currently using GPU resources'] }}"
