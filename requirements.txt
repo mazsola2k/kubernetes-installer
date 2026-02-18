@@ -2,3 +2,14 @@ kopf>=1.37.0
 kubernetes>=25.0.0
 pyyaml>=6.0
 deepdiff
+
+# Ansible Galaxy collections (not pip packages) are tracked in requirements.yml
+# Install with: ansible-galaxy collection install -r requirements.yml
+# (includes: ansible.posix)
+
+# Ansible and its Python dependencies (installed via dnf: ansible-core)
+ansible-core>=2.14.0
+cryptography
+jinja2
+markupsafe
+resolvelib

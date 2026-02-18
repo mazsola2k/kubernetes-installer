@@ -153,6 +153,13 @@ Each step can be executed manually via Ansible or driven declaratively through C
 
 All commands are executed from the repository root (no absolute paths required).
 
+> **Before you begin:** Make sure `ansible-core` and the required collections are installed — see the [Prerequisites](#prerequisites) section above.
+>
+> ```bash
+> sudo dnf install -y ansible-core
+> ansible-galaxy collection install -r requirements.yml
+> ```
+
 ```bash
 # 1. Install Kubernetes
 ansible-playbook k8s-redhat-kubernetes-controller.yaml -e k8s_action=install
@@ -403,6 +410,23 @@ When these CRs are applied:
 * Access to a Red Hat-compatible Kubernetes cluster (for example, OpenShift or ROSA) with cluster-admin privileges.
 * Red Hat / Trial Microsoft / Oracle Developer / Trial licensing or evaluation media.
 * Optional: Telemetry/OTel backend credentials for telemetry ingestion.
+
+### Installing prerequisites (first-time setup)
+
+Before running any playbook, ensure `ansible-core` and the required Ansible collections and Python packages are installed on the control host:
+
+```bash
+# 1. Install ansible-core (Fedora / RHEL / CentOS)
+sudo dnf install -y ansible-core
+
+# 2. Install required Ansible Galaxy collections
+ansible-galaxy collection install -r requirements.yml
+
+# 3. (Optional) Install Python operator dependencies
+pip install -r requirements.txt
+```
+
+> **Note:** `requirements.yml` declares `ansible.posix` (needed for SELinux management in the Kubernetes playbook). `requirements.txt` lists Python packages needed for the Kopf operator and TUI.
 
 ## Operational Guidelines
 

@@ -1,0 +1,9 @@
+---
+# Ansible Galaxy collection requirements
+# Install with: ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: ansible.posix
+    version: ">=2.1.0"
+
+  - name: kubernetes.core
+    version: ">=2.4.0"

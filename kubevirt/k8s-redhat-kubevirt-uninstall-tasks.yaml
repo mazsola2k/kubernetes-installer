@@ -11,6 +11,30 @@
       - "This will remove KubeVirt, all VMs, CDI, and related resources"
       - "WARNING: All virtual machines will be deleted!"
 
+# Activate the same venv used by the install tasks so kubernetes.core.k8s
+# modules can find the kubernetes Python library.
+- name: Ensure Python venv tooling is installed
+  ansible.builtin.dnf:
+    name: python3-virtualenv
+    state: present
+
+- name: Create venv for kubevirt Ansible dependencies (idempotent)
+  ansible.builtin.command: python3 -m venv /opt/kubevirt-ansible-venv
+  args:
+    creates: /opt/kubevirt-ansible-venv/bin/python
+
+- name: Install Python deps for kubevirt tasks in venv
+  ansible.builtin.pip:
+    name:
+      - kubernetes
+      - openshift
+    state: present
+    virtualenv: /opt/kubevirt-ansible-venv
+
+- name: Use kubevirt venv as interpreter for subsequent tasks
+  ansible.builtin.set_fact:
+    ansible_python_interpreter: /opt/kubevirt-ansible-venv/bin/python
+
 - name: Ensure kubevirt_namespace fact present
   ansible.builtin.set_fact:
     kv_namespace: "{{ kubevirt_namespace | default('kubevirt') }}"

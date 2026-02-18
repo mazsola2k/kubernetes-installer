@@ -275,7 +275,28 @@
   ansible.builtin.command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
   register: calico_apply
   changed_when: "calico_apply.rc == 0"
-  
+
+# On Fedora/RHEL, containerd is configured to look for CNI plugins in /usr/libexec/cni/
+# but the calico-node DaemonSet installs its CNI binaries to /opt/cni/bin/ by default.
+# We wait for calico-node to start (so it has copied its binaries), then symlink them.
+- name: Wait for calico-node DaemonSet to install CNI binaries
+  ansible.builtin.shell: |
+    kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+  register: calico_node_ready
+  changed_when: false
+  failed_when: false
+
+- name: Symlink Calico CNI binaries into /usr/libexec/cni/ (Fedora/RHEL fix)
+  ansible.builtin.file:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    state: link
+    force: yes
+  loop:
+    - { src: /opt/cni/bin/calico,      dest: /usr/libexec/cni/calico }
+    - { src: /opt/cni/bin/calico-ipam, dest: /usr/libexec/cni/calico-ipam }
+  when: calico_apply.changed or calico_node_ready.rc == 0
+
 - name: Ensure Calico FelixConfiguration allows pod egress (natOutgoing)
   ansible.builtin.shell: |
     kubectl patch felixconfiguration default --type='merge' -p '{"spec":{"natOutgoing": true}}'
