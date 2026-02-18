@@ -1,0 +1,96 @@
+---
+# Check NVIDIA GPU LLM status
+
+- name: Check if LLM pod exists
+  command: kubectl get pod {{ llm_name }} -n {{ llm_namespace }}
+  register: llm_pod_exists
+  changed_when: false
+  failed_when: false
+
+- name: Get LLM pod detailed status
+  command: kubectl get pod {{ llm_name }} -n {{ llm_namespace }} -o json
+  register: llm_pod_json
+  changed_when: false
+  when: llm_pod_exists.rc == 0
+
+- name: Parse LLM pod status
+  set_fact:
+    llm_status:
+      exists: "{{ llm_pod_exists.rc == 0 }}"
+      phase: "{{ (llm_pod_json.stdout | from_json).status.phase if llm_pod_exists.rc == 0 else 'Not Found' }}"
+      ready: "{{ (llm_pod_json.stdout | from_json).status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('False') if llm_pod_exists.rc == 0 else 'False' }}"
+      gpu_limit: "{{ (llm_pod_json.stdout | from_json).spec.containers[0].resources.limits['nvidia.com/gpu'] | default('0') if llm_pod_exists.rc == 0 else '0' }}"
+      model: "{{ (llm_pod_json.stdout | from_json).metadata.labels.model | default('unknown') if llm_pod_exists.rc == 0 else 'unknown' }}"
+
+- name: Display LLM status
+  debug:
+    msg:
+      - "LLM Pod Status:"
+      - "  Name: {{ llm_name }}"
+      - "  Namespace: {{ llm_namespace }}"
+      - "  Exists: {{ llm_status.exists }}"
+      - "  Phase: {{ llm_status.phase }}"
+      - "  Ready: {{ llm_status.ready }}"
+      - "  GPU Allocated: {{ llm_status.gpu_limit }}"
+      - "  Model: {{ llm_status.model }}"
+
+- name: Get LLM pod logs (last 20 lines)
+  command: kubectl logs {{ llm_name }} -n {{ llm_namespace }} --tail=20
+  register: llm_logs
+  changed_when: false
+  failed_when: false
+  when: llm_status.exists
+
+- name: Display recent logs
+  debug:
+    msg: "{{ llm_logs.stdout_lines }}"
+  when: llm_status.exists and llm_logs.rc == 0
+
+- name: Check Ollama models loaded in pod
+  command: kubectl exec {{ llm_name }} -n {{ llm_namespace }} -- ollama list
+  register: ollama_models
+  changed_when: false
+  failed_when: false
+  when: llm_status.exists and llm_status.phase == 'Running'
+
+- name: Display loaded models
+  debug:
+    msg: "{{ ollama_models.stdout_lines }}"
+  when: llm_status.exists and ollama_models.rc == 0
+
+- name: Check GPU utilization in pod
+  command: kubectl exec {{ llm_name }} -n {{ llm_namespace }} -- nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total --format=csv,noheader
+  register: gpu_utilization
+  changed_when: false
+  failed_when: false
+  when: llm_status.exists and llm_status.phase == 'Running'
+
+- name: Display GPU utilization
+  debug:
+    msg: "{{ gpu_utilization.stdout_lines }}"
+  when: llm_status.exists and gpu_utilization.rc == 0
+
+- name: Check service status if enabled
+  command: kubectl get service {{ llm_name }}-service -n {{ llm_namespace }} -o json
+  register: llm_service
+  changed_when: false
+  failed_when: false
+
+- name: Display service info
+  debug:
+    msg:
+      - "Service: {{ llm_name }}-service"
+      - "ClusterIP: {{ (llm_service.stdout | from_json).spec.clusterIP }}"
+      - "Port: {{ (llm_service.stdout | from_json).spec.ports[0].port }}"
+  when: llm_service.rc == 0
+
+- name: Summary
+  debug:
+    msg:
+      - "=== LLM Deployment Summary ==="
+      - "Status: {{ 'Running' if (llm_status.exists and llm_status.phase == 'Running') else 'Not Running' }}"
+      - "Pod: {{ llm_name }}"
+      - "Model: {{ llm_status.model }}"
+      - "GPU: {{ llm_status.gpu_limit }}"
+      - ""
+      - "{% if llm_status.exists and llm_status.phase == 'Running' %}To interact: kubectl exec -it {{ llm_name }} -n {{ llm_namespace }} -- ollama run {{ llm_model }}{% endif %}"

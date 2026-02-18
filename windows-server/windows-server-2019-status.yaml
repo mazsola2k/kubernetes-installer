@@ -120,7 +120,6 @@
       ansible.builtin.stat:
         path: "{{ item }}"
         get_checksum: no   # Avoid reading entire large disk image files
-        get_md5: no
         get_mime: no
       register: storage_files
       loop:

@@ -1257,3 +1257,156 @@ def delete_oracledb(body, meta, spec, status, namespace, patch, **kwargs):
         error_message = str(e)
         log_event(f"[OPERATOR] Error during Oracle DB cleanup: {error_message}")
 
+
+# NVIDIA GPU LLM Handlers
+@kopf.on.create('infra.example.com', 'v1', 'nvidiagpullms')
+@kopf.on.update('infra.example.com', 'v1', 'nvidiagpullms')
+def handle_nvidiagpullm(body, meta, spec, status, namespace, diff, old, new, patch, **kwargs):
+    """Handle NVIDIA GPU LLM deployment"""
+    terminal_phases = ['Ready', 'Failed', 'Skipped']
+    if status and status.get('phase') in terminal_phases and status.get('observedGeneration') == meta.get('generation'):
+        msg = f"[OPERATOR] Skipping execution for {meta.get('name')} (phase={status.get('phase')})"
+        log_event(msg)
+        patch.status['phase'] = status.get('phase')
+        patch.status['message'] = status.get('message', '')
+        patch.status['observedGeneration'] = status.get('observedGeneration')
+        return
+    
+    log_event("[OPERATOR] handle_nvidiagpullm triggered!")
+    name = meta.get('name')
+    action = get_var('action', spec, 'install')
+    llm_name = get_var('llmName', spec, name)
+    llm_namespace = get_var('namespace', spec, namespace)
+    model = get_var('model', spec, 'tinyllama')
+    gpu_count = get_var('gpuCount', spec, 1)
+    
+    log_event(f"[OPERATOR] NVIDIA GPU LLM CR received: name={name}, action={action}, llm_name={llm_name}, model={model}")
+    
+    try:
+        patch.status['phase'] = 'InProgress'
+        patch.status['message'] = f"NVIDIA GPU LLM {action} in progress for {llm_name}"
+        patch.status['reason'] = 'Processing'
+        patch.status['observedGeneration'] = meta.get('generation')
+        patch.status['podName'] = llm_name
+        patch.status['modelLoaded'] = model
+        now = datetime.utcnow().isoformat() + 'Z'
+        cond = {
+            'type': 'Ready',
+            'status': 'False',
+            'reason': 'Processing',
+            'message': f"NVIDIA GPU LLM {action} in progress for {llm_name}",
+            'lastTransitionTime': now,
+        }
+        existing = status.get('conditions', []) if status else []
+        patch.status['conditions'] = [c for c in existing if c.get('type') != 'Ready'] + [cond]
+    except Exception:
+        pass
+
+    try:
+        kopf.info(body, reason='Processing', message=f'Starting NVIDIA GPU LLM {action} for {llm_name}')
+        playbook_path = str(REPO_ROOT / 'nvidia-gpu-llm-controller.yaml')
+        playbook_vars = {
+            'action': action,
+            'llmName': llm_name,
+            'namespace': llm_namespace,
+            'model': model,
+            'gpuCount': gpu_count,
+            'memory': get_var('memory', spec, '4Gi'),
+            'cpuCores': get_var('cpuCores', spec, 2),
+            'serviceEnabled': get_var('serviceEnabled', spec, False),
+            'servicePort': get_var('servicePort', spec, 11434),
+            'prompts': get_var('prompts', spec, ['Explain what is Kubernetes in one sentence.']),
+            'persistentStorage': get_var('persistentStorage', spec, False),
+            'storageSize': get_var('storageSize', spec, '10Gi'),
+            'imagePullPolicy': get_var('imagePullPolicy', spec, 'IfNotPresent'),
+            'keepAlive': get_var('keepAlive', spec, True),
+        }
+        
+        log_event(f"[OPERATOR] Running NVIDIA GPU LLM playbook for {action} on {llm_name}")
+        result = run_ansible_playbook(playbook_path, playbook_vars)
+        
+        if result['success']:
+            log_event(f"[OPERATOR] Playbook succeeded for NVIDIA GPU LLM {action} on {llm_name}")
+            patch.status['phase'] = 'Ready'
+            patch.status['message'] = f"NVIDIA GPU LLM {action} completed successfully for {llm_name}"
+            patch.status['reason'] = 'Completed'
+            patch.status['observedGeneration'] = meta.get('generation')
+            patch.status['gpuAssigned'] = True
+            now = datetime.utcnow().isoformat() + 'Z'
+            cond = {
+                'type': 'Ready',
+                'status': 'True',
+                'reason': 'Completed',
+                'message': f"NVIDIA GPU LLM {action} completed successfully for {llm_name}",
+                'lastTransitionTime': now,
+            }
+            existing = status.get('conditions', []) if status else []
+            patch.status['conditions'] = [c for c in existing if c.get('type') != 'Ready'] + [cond]
+            return
+        else:
+            log_event(f"[OPERATOR] Playbook failed for NVIDIA GPU LLM {action} on {llm_name}: {result['error']}")
+            patch.status['phase'] = 'Failed'
+            patch.status['message'] = f"NVIDIA GPU LLM {action} failed for {llm_name}: {result['error']}"
+            patch.status['reason'] = 'Failed'
+            patch.status['observedGeneration'] = meta.get('generation')
+            patch.status['gpuAssigned'] = False
+            now = datetime.utcnow().isoformat() + 'Z'
+            cond = {
+                'type': 'Ready',
+                'status': 'False',
+                'reason': 'Failed',
+                'message': f"NVIDIA GPU LLM {action} failed for {llm_name}",
+                'lastTransitionTime': now,
+            }
+            existing = status.get('conditions', []) if status else []
+            patch.status['conditions'] = [c for c in existing if c.get('type') != 'Ready'] + [cond]
+            return
+    
+    except Exception as e:
+        error_message = str(e)
+        log_event(f"[OPERATOR] Error processing NVIDIA GPU LLM CR: {error_message}")
+        try:
+            kopf.exception(body, reason='Error', message=error_message)
+        except Exception as patch_err:
+            log_event(f"[OPERATOR] Failed to patch CR status due to: {patch_err}")
+        patch.status['phase'] = 'Failed'
+        patch.status['message'] = f"NVIDIA GPU LLM operation failed: {error_message}"
+        patch.status['reason'] = 'Error'
+        patch.status['observedGeneration'] = meta.get('generation')
+        return
+
+
+@kopf.on.delete('infra.example.com', 'v1', 'nvidiagpullms')
+def delete_nvidiagpullm(body, meta, spec, status, namespace, patch, **kwargs):
+    """Handle NVIDIA GPU LLM deletion"""
+    name = meta.get('name')
+    llm_name = get_var('llmName', spec, name)
+    llm_namespace = get_var('namespace', spec, namespace)
+    
+    log_event(f"[OPERATOR] NVIDIA GPU LLM CR deletion triggered: {name}")
+    patch.status['phase'] = 'Terminating'
+    patch.status['message'] = f"Delete requested for NVIDIA GPU LLM {llm_name}"
+    patch.status['reason'] = 'DeleteRequested'
+    patch.status['observedGeneration'] = meta.get('generation')
+
+    try:
+        kopf.info(body, reason='Cleanup', message=f'Starting NVIDIA GPU LLM cleanup for {llm_name}')
+        playbook_path = str(REPO_ROOT / 'nvidia-gpu-llm-controller.yaml')
+        playbook_vars = {
+            'action': 'uninstall',
+            'llmName': llm_name,
+            'namespace': llm_namespace,
+        }
+        
+        log_event(f"[OPERATOR] Running NVIDIA GPU LLM cleanup for {llm_name}")
+        result = run_ansible_playbook(playbook_path, playbook_vars)
+        
+        if result['success']:
+            log_event(f"[OPERATOR] NVIDIA GPU LLM cleanup succeeded for {llm_name}")
+        else:
+            log_event(f"[OPERATOR] NVIDIA GPU LLM cleanup failed for {llm_name}: {result.get('error')}")
+    
+    except Exception as e:
+        error_message = str(e)
+        log_event(f"[OPERATOR] Error during NVIDIA GPU LLM cleanup: {error_message}")
+

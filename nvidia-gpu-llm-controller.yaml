@@ -1,0 +1,41 @@
+---
+- name: NVIDIA GPU LLM Controller
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    llm_action: "{{ action | default('install') }}"
+    llm_name: "{{ llmName | default('gpu-llm-pod') }}"
+    llm_namespace: "{{ namespace | default('default') }}"
+    llm_model: "{{ model | default('tinyllama') }}"
+    llm_gpu_count: "{{ gpuCount | default(1) }}"
+    llm_memory: "{{ memory | default('4Gi') }}"
+    llm_cpu_cores: "{{ cpuCores | default(2) }}"
+    llm_service_enabled: "{{ serviceEnabled | default(false) }}"
+    llm_service_port: "{{ servicePort | default(11434) }}"
+    llm_prompts: "{{ prompts | default(['Explain what is Kubernetes in one sentence.']) }}"
+    llm_persistent_storage: "{{ persistentStorage | default(false) }}"
+    llm_storage_size: "{{ storageSize | default('10Gi') }}"
+    llm_image_pull_policy: "{{ imagePullPolicy | default('IfNotPresent') }}"
+    llm_keep_alive: "{{ keepAlive | default(true) }}"
+
+  tasks:
+    - name: Display LLM action
+      debug:
+        msg: "NVIDIA GPU LLM Controller - Action: {{ llm_action }}, Model: {{ llm_model }}, Name: {{ llm_name }}"
+
+    - name: Execute install tasks
+      include_tasks: nvidia-gpu/nvidia-gpu-llm-install-tasks.yaml
+      when: llm_action == 'install'
+
+    - name: Execute status tasks
+      include_tasks: nvidia-gpu/nvidia-gpu-llm-status-tasks.yaml
+      when: llm_action == 'status'
+
+    - name: Execute uninstall tasks
+      include_tasks: nvidia-gpu/nvidia-gpu-llm-uninstall-tasks.yaml
+      when: llm_action == 'uninstall'
+
+    - name: Display completion message
+      debug:
+        msg: "NVIDIA GPU LLM {{ llm_action }} completed for {{ llm_name }}"

@@ -1,0 +1,70 @@
+---
+# Uninstall NVIDIA GPU LLM Pod
+
+- name: Check if LLM pod exists
+  command: kubectl get pod {{ llm_name }} -n {{ llm_namespace }}
+  register: llm_pod_check
+  changed_when: false
+  failed_when: false
+
+- name: Delete LLM pod
+  command: kubectl delete pod {{ llm_name }} -n {{ llm_namespace }} --wait=true --timeout=60s
+  register: pod_delete
+  changed_when: pod_delete.rc == 0
+  failed_when: false
+  when: llm_pod_check.rc == 0
+
+- name: Check if service exists
+  command: kubectl get service {{ llm_name }}-service -n {{ llm_namespace }}
+  register: service_check
+  changed_when: false
+  failed_when: false
+
+- name: Delete LLM service
+  command: kubectl delete service {{ llm_name }}-service -n {{ llm_namespace }}
+  register: service_delete
+  changed_when: service_delete.rc == 0
+  failed_when: false
+  when: service_check.rc == 0
+
+- name: Check if PVC exists
+  command: kubectl get pvc {{ llm_name }}-storage -n {{ llm_namespace }}
+  register: pvc_check
+  changed_when: false
+  failed_when: false
+
+- name: Delete PersistentVolumeClaim (if persistent storage was enabled)
+  command: kubectl delete pvc {{ llm_name }}-storage -n {{ llm_namespace }} --wait=true --timeout=30s
+  register: pvc_delete
+  changed_when: pvc_delete.rc == 0
+  failed_when: false
+  when: pvc_check.rc == 0
+
+- name: Wait for resources to be fully deleted
+  pause:
+    seconds: 5
+
+- name: Verify LLM pod is deleted
+  command: kubectl get pod {{ llm_name }} -n {{ llm_namespace }}
+  register: verify_delete
+  changed_when: false
+  failed_when: false
+
+- name: Confirm deletion
+  debug:
+    msg:
+      - "=== NVIDIA GPU LLM Uninstall Complete ==="
+      - "Pod {{ llm_name }}: {{ 'Deleted' if verify_delete.rc != 0 else 'Still present (manual cleanup may be needed)' }}"
+      - "Service: {{ 'Deleted' if service_delete.changed else 'Not found' }}"
+      - "PVC: {{ 'Deleted' if pvc_delete.changed else 'Not found' }}"
+
+- name: Display GPU capacity now available
+  shell: kubectl get nodes -o json | jq -r '.items[] | {name: .metadata.name, gpu_capacity: .status.capacity["nvidia.com/gpu"], gpu_allocatable: .status.allocatable["nvidia.com/gpu"]}'
+  register: gpu_available
+  changed_when: false
+  failed_when: false
+
+- name: Show available GPU resources
+  debug:
+    msg: "{{ gpu_available.stdout_lines }}"
+  when: gpu_available.rc == 0

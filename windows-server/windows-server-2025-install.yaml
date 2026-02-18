@@ -47,6 +47,43 @@
       VAULT_TOKEN: "{{ vault_root_token.stdout | trim }}"
   tags: always
 
+- name: Check if Vault is sealed
+  ansible.builtin.shell: |
+    kubectl exec -n default vault-0 -- vault status -format=json
+  environment:
+    VAULT_ADDR: "http://127.0.0.1:8200"
+  register: vault_status_check
+  changed_when: false
+  failed_when: false
+  tags: always
+
+- name: Parse Vault sealed status
+  ansible.builtin.set_fact:
+    vault_is_sealed: "{{ (vault_status_check.stdout | from_json).sealed }}"
+  when: vault_status_check.rc == 0 or vault_status_check.rc == 2
+  tags: always
+
+- name: Start Vault port-forward if Vault is sealed
+  ansible.builtin.shell: |
+    nohup kubectl port-forward -n default svc/vault 8200:8200 > /tmp/vault-portforward.log 2>&1 &
+    echo $! > /tmp/vault-portforward.pid
+    sleep 3
+  when: vault_is_sealed | default(false) | bool
+  changed_when: true
+  tags: always
+
+- name: Unseal Vault if sealed (via port-forward from host)
+  ansible.builtin.shell: |
+    export VAULT_ADDR=http://localhost:8200
+    vault operator unseal $(jq -r '.unseal_keys_b64[0]' /root/vault-init.json)
+  environment:
+    VAULT_ADDR: "http://localhost:8200"
+  when: vault_is_sealed | default(false) | bool
+  become: true
+  register: vault_unseal
+  changed_when: vault_unseal.rc == 0
+  tags: always
+
 - name: Test Vault access via kubectl exec
   ansible.builtin.shell: |
     kubectl exec -n default vault-0 -- vault status
@@ -54,6 +91,7 @@
     VAULT_ADDR: "http://127.0.0.1:8200"
   register: vault_status_test
   changed_when: false
+  failed_when: false
   tags: always
 
 - name: Show Vault status from pod

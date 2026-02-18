@@ -1,193 +1,217 @@
-# Windows Server 2025 Status Tasks
+# Windows Server 2025 Status Tasks (moved from top-level)
 # Controller remains top-level.
 
 ---
-- name: Windows Server 2025 status summary
-  hosts: localhost
-  gather_facts: false
+# Windows Server 2019 Status and Management Module
+# This module provides status checking and basic management operations
 
-  tasks:
-    - name: Set storage_dir default
-      ansible.builtin.set_fact:
-        storage_dir: "{{ storage_dir | default('/var/lib/kubevirt') }}"
+- name: Display Windows Server status information
+  ansible.builtin.debug:
+    msg:
+      - "📊 Windows Server 2025 Status Check"
+      - "VM Name: {{ vm_name }}"
+      - "Namespace: {{ kubevirt_namespace }}"
 
-    - name: Display Windows Server status information
-      ansible.builtin.debug:
-        msg:
-          - "📊 Windows Server 2025 Status Check"
-          - "VM Name: {{ vm_name }}"
-          - "Namespace: {{ kubevirt_namespace }}"
+- name: Check VM resources
+  block:
+    - name: Check VirtualMachine
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: vm_info
 
-    - name: Check VM resources
-      block:
-        - name: Check VirtualMachine
-          kubernetes.core.k8s_info:
-            api_version: kubevirt.io/v1
-            kind: VirtualMachine
-            name: "{{ vm_name }}"
-            namespace: "{{ kubevirt_namespace }}"
-          register: vm_info
+    - name: Check VirtualMachineInstance
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: vmi_info
 
-        - name: Check VirtualMachineInstance
-          kubernetes.core.k8s_info:
-            api_version: kubevirt.io/v1
-            kind: VirtualMachineInstance
-            name: "{{ vm_name }}"
-            namespace: "{{ kubevirt_namespace }}"
-          register: vmi_info
-
-        - name: Check VM Pod
-          kubernetes.core.k8s_info:
-            api_version: v1
-            kind: Pod
-            namespace: "{{ kubevirt_namespace }}"
-            label_selectors:
-              - "kubevirt.io/vm={{ vm_name }}"
-          register: pod_info
-
-    - name: Inspect DNS chain (pod resolv.conf and CoreDNS)
-      block:
-        - name: Locate virt-launcher pod name
-          ansible.builtin.set_fact:
-            virtlauncher_pod: "{{ pod_info.resources[0].metadata.name }}"
-          when: pod_info.resources | length > 0
-
-        - name: Read /etc/resolv.conf from VM pod
-          ansible.builtin.shell: |
-            if [ -n "{{ virtlauncher_pod | default('') }}" ]; then
-              kubectl -n {{ kubevirt_namespace }} exec {{ virtlauncher_pod }} -c compute -- cat /etc/resolv.conf 2>/dev/null || echo "Failed to read resolv.conf"
-            else
-              echo "Pod not found"
-            fi
-          register: pod_resolvconf
-          when: virtlauncher_pod is defined
-          ignore_errors: true
-
-        - name: Get CoreDNS service (kube-dns)
-          kubernetes.core.k8s_info:
-            api_version: v1
-            kind: Service
-            name: kube-dns
-            namespace: kube-system
-          register: kube_dns_svc
-          ignore_errors: true
-
-    - name: Check storage resources
-      block:
-        - name: Check PersistentVolumes
-          kubernetes.core.k8s_info:
-            api_version: v1
-            kind: PersistentVolume
-            name: "{{ item }}"
-          register: pv_info
-          loop:
-            - win2025server-system-pv
-            - win2025server-virtio-iso-pv
-          ignore_errors: true
-
-        - name: Check PersistentVolumeClaims
-          kubernetes.core.k8s_info:
-            api_version: v1
-            kind: PersistentVolumeClaim
-            name: "{{ item }}"
-            namespace: "{{ kubevirt_namespace }}"
-          register: pvc_info
-          loop:
-            - win2025server-system-pvc
-            - win2025server-virtio-iso-pvc
-          ignore_errors: true
-
-    - name: Check sysprep secret
+    - name: Check VM Pod
       kubernetes.core.k8s_info:
         api_version: v1
-        kind: Secret
-        name: win2025server-sysprep
+        kind: Pod
         namespace: "{{ kubevirt_namespace }}"
-      register: sysprep_secret
+        label_selectors:
+          - "kubevirt.io/vm={{ vm_name }}"
+      register: pod_info
+
+- name: Inspect DNS chain (pod resolv.conf and CoreDNS)
+  block:
+    - name: Locate virt-launcher pod name
+      ansible.builtin.set_fact:
+        virtlauncher_pod: "{{ pod_info.resources[0].metadata.name }}"
+      when: pod_info.resources | length > 0
+
+    - name: Read /etc/resolv.conf from VM pod
+      ansible.builtin.shell: |
+        if [ -n "{{ virtlauncher_pod | default('') }}" ]; then
+          kubectl -n {{ kubevirt_namespace }} exec {{ virtlauncher_pod }} -c compute -- cat /etc/resolv.conf 2>/dev/null || echo "Failed to read resolv.conf"
+        else
+          echo "Pod not found"
+        fi
+      register: pod_resolvconf
+      when: virtlauncher_pod is defined
       ignore_errors: true
 
-    - name: Check access services
-      block:
-        - name: Check Services
-          kubernetes.core.k8s_info:
-            api_version: v1
-            kind: Service
-            name: "{{ item }}"
-            namespace: "{{ kubevirt_namespace }}"
-          register: service_info
-          loop:
-            - win2025server-vnc
-          ignore_errors: true
+    - name: Get CoreDNS service (kube-dns)
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: kube-dns
+        namespace: kube-system
+      register: kube_dns_svc
+      ignore_errors: true
 
-    - name: Check storage files
-      block:
-        - name: Check storage directories and files
-          tags: [fast_status]
-          ansible.builtin.stat:
-            path: "{{ item }}"
-            get_checksum: no   # Avoid reading entire large disk image files
-            get_md5: no
-            get_mime: no
-          register: storage_files
-          loop:
-            - "{{ storage_dir }}/win2025server-system-disk/disk.img"
-            - "{{ storage_dir }}/win2025server-virtio-iso/disk.img"
-            - "{{ storage_dir }}/Autounattend.xml"
+- name: Check storage resources
+  block:
+    - name: Check PersistentVolumes
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolume
+        name: "{{ item }}"
+      register: pv_info
+      loop:
+        - win2025server-system-pv
+        - win2025server-virtio-iso-pv
+      ignore_errors: true
 
-    - name: Set DNS diagnostics output
-      ansible.builtin.set_fact:
-        pod_resolvconf_output: "{{ pod_resolvconf.stdout if (pod_resolvconf is defined and pod_resolvconf.stdout is defined) else 'N/A' }}"
+    - name: Check PersistentVolumeClaims
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ item }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: pvc_info
+      loop:
+        - win2025server-system-pvc
+        - win2025server-virtio-iso-pvc
+      ignore_errors: true
 
-    - name: Display comprehensive status
-      ansible.builtin.debug:
-        msg: |
-          🔍 Windows Server 2025 Complete Status Report
+- name: Check sysprep secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: win2025server-sysprep
+    namespace: "{{ kubevirt_namespace }}"
+  register: sysprep_secret
+  ignore_errors: true
 
-          💻 Virtual Machine:
-            Status: {{ vm_info.resources[0].status.printableStatus | default('NOT FOUND') if vm_info.resources | length > 0 else 'NOT FOUND' }}
-            Ready: {{ vm_info.resources[0].status.ready | default('N/A') if vm_info.resources | length > 0 else 'N/A' }}
-            Created: {{ vm_info.resources[0].metadata.creationTimestamp | default('N/A') if vm_info.resources | length > 0 else 'N/A' }}
+- name: Check access services
+  block:
+    - name: Check Services
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ item }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: service_info
+      loop:
+        - win2025server-vnc
+      ignore_errors: true
 
-          🏃 Virtual Machine Instance:
-            Phase: {{ vmi_info.resources[0].status.phase | default('NOT FOUND') if vmi_info.resources | length > 0 else 'NOT FOUND' }}
-            Node: {{ vmi_info.resources[0].status.nodeName | default('N/A') if vmi_info.resources | length > 0 else 'N/A' }}
-            IP Address: {{ vmi_info.resources[0].status.interfaces[0].ipAddress | default('N/A') if (vmi_info.resources | length > 0 and vmi_info.resources[0].status.interfaces is defined and vmi_info.resources[0].status.interfaces | length > 0) else 'N/A' }}
-            Ready: {{ (vmi_info.resources[0].status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('N/A')) if vmi_info.resources | length > 0 else 'N/A' }}
+- name: Check storage files
+  block:
+    - name: Check storage directories and files
+      tags: [fast_status]
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: no   # Avoid reading entire large disk image files
+        get_mime: no
+      register: storage_files
+      loop:
+        - "{{ storage_dir }}/win2025server-system-disk/disk.img"
+        - "{{ storage_dir }}/win2025server-virtio-iso/disk.img"
+        - "{{ storage_dir }}/Autounattend.xml"
 
-          🐳 Pod Status:
-            Pod Phase: {{ pod_info.resources[0].status.phase | default('NOT FOUND') if pod_info.resources | length > 0 else 'NOT FOUND' }}
-            Pod Name: {{ pod_info.resources[0].metadata.name | default('N/A') if pod_info.resources | length > 0 else 'N/A' }}
-            Containers Ready: {{ (pod_info.resources[0].status.containerStatuses | selectattr('ready', 'equalto', true) | list | length) ~ '/' ~ (pod_info.resources[0].status.containerStatuses | length) if pod_info.resources | length > 0 else 'N/A' }}
+- name: Display comprehensive status
+  ansible.builtin.debug:
+    msg: |
+      🔍 Windows Server 2025 Complete Status Report
 
-          💾 Storage Resources:
-            System PV: {{ 'BOUND' if (pv_info.results[0].resources | length > 0 and pv_info.results[0].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
-            ISO PV: {{ 'BOUND' if (pv_info.results[1].resources | length > 0 and pv_info.results[1].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
-            System PVC: {{ 'BOUND' if (pvc_info.results[0].resources | length > 0 and pvc_info.results[0].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
-            ISO PVC: {{ 'BOUND' if (pvc_info.results[1].resources | length > 0 and pvc_info.results[1].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
-            Sysprep Secret: {{ 'PRESENT' if (sysprep_secret.resources | default([]) | length) > 0 else 'MISSING' }}
-          📁 Storage Files:
-            System Disk: {{ 'EXISTS (' ~ ((storage_files.results[0].stat.size | default(0) / 1024 / 1024 / 1024) | round(2) | string) ~ ' GB)' if storage_files.results[0].stat.exists else 'MISSING' }}
-            ISO File: {{ 'EXISTS (' ~ ((storage_files.results[1].stat.size | default(0) / 1024 / 1024 / 1024) | round(2) | string) ~ ' GB)' if storage_files.results[1].stat.exists else 'MISSING' }}
-            Autounattend XML: {{ 'EXISTS' if storage_files.results[2].stat.exists else 'MISSING' }}
+      💻 Virtual Machine:
+        Status: {{ vm_info.resources[0].status.printableStatus | default('NOT FOUND') if vm_info.resources | length > 0 else 'NOT FOUND' }}
+        Ready: {{ vm_info.resources[0].status.ready | default('N/A') if vm_info.resources | length > 0 else 'N/A' }}
+        Created: {{ vm_info.resources[0].metadata.creationTimestamp | default('N/A') if vm_info.resources | length > 0 else 'N/A' }}
 
-          {% set vnc_res = (service_info.results | selectattr('item','equalto','win2025server-vnc') | list) %}
-          🌐 Access Services:
-            VNC Service: {{ 'AVAILABLE (NodePort ' ~ (vnc_res[0].resources[0].spec.ports[0].nodePort | string) ~ ')' if (vnc_res|length>0 and vnc_res[0].resources|length>0) else 'MISSING' }}
+      🏃 Virtual Machine Instance:
+        Phase: {{ vmi_info.resources[0].status.phase | default('NOT FOUND') if vmi_info.resources | length > 0 else 'NOT FOUND' }}
+        Node: {{ vmi_info.resources[0].status.nodeName | default('N/A') if vmi_info.resources | length > 0 else 'N/A' }}
+        IP Address: {{ vmi_info.resources[0].status.interfaces[0].ipAddress | default('N/A') if (vmi_info.resources | length > 0 and vmi_info.resources[0].status.interfaces is defined and vmi_info.resources[0].status.interfaces | length > 0) else 'N/A' }}
+        Ready: {{ (vmi_info.resources[0].status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('N/A')) if vmi_info.resources | length > 0 else 'N/A' }}
 
-          🔗 Access Commands:
-            VNC Console: virtctl vnc {{ vm_name }} -n {{ kubevirt_namespace }}
-            Serial Console: virtctl console {{ vm_name }} -n {{ kubevirt_namespace }}
+      🐳 Pod Status:
+        Pod Phase: {{ pod_info.resources[0].status.phase | default('NOT FOUND') if pod_info.resources | length > 0 else 'NOT FOUND' }}
+        Pod Name: {{ pod_info.resources[0].metadata.name | default('N/A') if pod_info.resources | length > 0 else 'N/A' }}
+        Containers Ready: {{ (pod_info.resources[0].status.containerStatuses | selectattr('ready', 'equalto', true) | list | length) ~ '/' ~ (pod_info.resources[0].status.containerStatuses | length) if pod_info.resources | length > 0 else 'N/A' }}
 
-          🛠 Management Commands:
-            Start: virtctl start {{ vm_name }} -n {{ kubevirt_namespace }}
-            Stop: virtctl stop {{ vm_name }} -n {{ kubevirt_namespace }}
-            Restart: virtctl restart {{ vm_name }} -n {{ kubevirt_namespace }}
+      💾 Storage Resources:
+        System PV: {{ 'BOUND' if (pv_info.results[0].resources | length > 0 and pv_info.results[0].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
+        ISO PV: {{ 'BOUND' if (pv_info.results[1].resources | length > 0 and pv_info.results[1].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
+        System PVC: {{ 'BOUND' if (pvc_info.results[0].resources | length > 0 and pvc_info.results[0].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
+        ISO PVC: {{ 'BOUND' if (pvc_info.results[1].resources | length > 0 and pvc_info.results[1].resources[0].status.phase == 'Bound') else 'NOT BOUND/MISSING' }}
+        Sysprep Secret: {{ 'PRESENT' if (sysprep_secret.resources | default([]) | length) > 0 else 'MISSING' }}      📁 Storage Files:
+        System Disk: {{ 'EXISTS (' ~ ((storage_files.results[0].stat.size | default(0) / 1024 / 1024 / 1024) | round(2) | string) ~ ' GB)' if storage_files.results[0].stat.exists else 'MISSING' }}
+        ISO File: {{ 'EXISTS (' ~ ((storage_files.results[1].stat.size | default(0) / 1024 / 1024 / 1024) | round(2) | string) ~ ' GB)' if storage_files.results[1].stat.exists else 'MISSING' }}
+        Autounattend XML: {{ 'EXISTS' if storage_files.results[2].stat.exists else 'MISSING' }}
 
-    - name: Display DNS forwarding chain
-      ansible.builtin.debug:
-        msg:
-          - "🌐 DNS Chain Diagnostics"
-          - "In-VM resolver: 10.0.2.1 (KubeVirt dnsmasq)"
-          - "Pod upstream resolv.conf:"
-          - "{{ pod_resolvconf_output }}"
-          - "CoreDNS (kube-dns) ClusterIP: {{ kube_dns_svc.resources[0].spec.clusterIP | default('N/A') if kube_dns_svc.resources | length > 0 else 'N/A' }}"
+      {% set vnc_res = (service_info.results | selectattr('item','equalto','win2025server-vnc') | list) %}
+      🌐 Access Services:
+        VNC Service: {{ 'AVAILABLE (NodePort ' ~ (vnc_res[0].resources[0].spec.ports[0].nodePort | string) ~ ')' if (vnc_res|length>0 and vnc_res[0].resources|length>0) else 'MISSING' }}
+
+      🔗 Access Commands:
+        VNC Console: virtctl vnc {{ vm_name }} -n {{ kubevirt_namespace }}
+        Serial Console: virtctl console {{ vm_name }} -n {{ kubevirt_namespace }}
+
+      🛠 Management Commands:
+        Start: virtctl start {{ vm_name }} -n {{ kubevirt_namespace }}
+        Stop: virtctl stop {{ vm_name }} -n {{ kubevirt_namespace }}
+        Restart: virtctl restart {{ vm_name }} -n {{ kubevirt_namespace }}
+
+- name: Display DNS forwarding chain
+  ansible.builtin.debug:
+    msg:
+      - "🌐 DNS Chain Diagnostics"
+      - "In-VM resolver: 10.0.2.1 (KubeVirt dnsmasq)"
+      - "Pod upstream resolv.conf:"
+      - "{{ (pod_resolvconf.stdout | default('N/A')) }}"
+      - "CoreDNS (kube-dns) ClusterIP: {{ kube_dns_svc.resources[0].spec.clusterIP | default('N/A') if kube_dns_svc.resources | length > 0 else 'N/A' }}"
+
+- name: Get VNC service NodePort
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    name: "{{ vm_name }}-vnc"
+    namespace: "{{ kubevirt_namespace }}"
+  register: vnc_service_info
+  ignore_errors: true
+
+- name: Display VNC and access information
+  ansible.builtin.debug:
+    msg:
+      - ""
+      - "==================== Access & Connection Information ===================="
+      - ""
+      - "🖥️  VNC Access:"
+      - "  Direct: virtctl vnc {{ vm_name }} -n {{ kubevirt_namespace }}"
+      - "  Proxy: virtctl vnc {{ vm_name }} -n {{ kubevirt_namespace }} --proxy-only --port 5900"
+      - "  NodePort: {{ vnc_service_info.resources[0].spec.ports[0].nodePort if (vnc_service_info.resources | length > 0) else 'N/A' }}"
+      - ""
+      - "🪟 RDP Access (after Windows setup completes):"
+      - "  Method 1 - Port Forward: kubectl -n {{ kubevirt_namespace }} port-forward service/{{ vm_name }}-rdp 3389:3389"
+      - "  Method 2 - VM IP Direct: RDP to {{ vmi_info.resources[0].status.interfaces[0].ipAddress | default('VM_IP') }}:3389"
+      - "  Method 3 - virtctl: virtctl port-forward {{ vm_name }} -n {{ kubevirt_namespace }} 3389:3389"
+      - "  Then connect RDP client to: localhost:3389"
+      - ""
+      - "🛠️  Console Access:"
+      - "  Serial: virtctl console {{ vm_name }} -n {{ kubevirt_namespace }}"
+      - ""
+      - "🔐 Administrator Password:"
+      - "  Stored in Vault at: secret/data/windows-vm/win2025server/admin"
+      - "  Retrieve: vault kv get -field=password secret/data/windows-vm/win2025server/admin"
+      - "  (Requires VAULT_ADDR and VAULT_TOKEN environment variables)"
+      - ""
+      - "=========================================================================="

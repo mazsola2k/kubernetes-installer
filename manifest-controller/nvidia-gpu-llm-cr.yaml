@@ -1,0 +1,21 @@
+apiVersion: infra.example.com/v1
+kind: NvidiaGpuLlm
+metadata:
+  name: tinyllama-demo
+  namespace: default
+spec:
+  action: install
+  llmName: gpu-llm-pod
+  namespace: default
+  model: tinyllama
+  gpuCount: 1
+  memory: "4Gi"
+  cpuCores: 2
+  serviceEnabled: false
+  servicePort: 11434
+  prompts:
+    - "Explain what is Kubernetes in one sentence."
+    - "Write a haiku about GPU computing."
+  persistentStorage: false
+  keepAlive: true
+  imagePullPolicy: IfNotPresent

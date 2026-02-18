@@ -1,0 +1,226 @@
+---
+# Install NVIDIA GPU LLM Pod
+
+- name: Check if GPU device plugin is available
+  command: kubectl get daemonset -n kube-system nvidia-device-plugin-daemonset
+  register: device_plugin_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if GPU device plugin not found
+  fail:
+    msg: "NVIDIA device plugin not found. Please install GPU support first using nvidia-gpu-controller.yaml"
+  when: device_plugin_check.rc != 0
+
+- name: Check if GPU capacity is available
+  shell: kubectl get nodes -o json | jq -r '.items[].status.capacity["nvidia.com/gpu"] // "0"' | awk '{s+=$1} END {print s}'
+  register: total_gpu_capacity
+  changed_when: false
+
+- name: Fail if insufficient GPU capacity
+  fail:
+    msg: "Insufficient GPU capacity. Required: {{ llm_gpu_count }}, Available: {{ total_gpu_capacity.stdout }}"
+  when: total_gpu_capacity.stdout | int < llm_gpu_count | int
+
+- name: Check if LLM pod already exists
+  command: kubectl get pod {{ llm_name }} -n {{ llm_namespace }}
+  register: existing_pod
+  changed_when: false
+  failed_when: false
+
+- name: Delete existing LLM pod if present
+  command: kubectl delete pod {{ llm_name }} -n {{ llm_namespace }} --wait=true --timeout=60s
+  when: existing_pod.rc == 0
+
+- name: Create PersistentVolumeClaim for model storage
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ llm_name }}-storage"
+        namespace: "{{ llm_namespace }}"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "{{ llm_storage_size }}"
+  when: llm_persistent_storage | bool
+
+- name: Build prompts script
+  set_fact:
+    prompts_script: |
+      {% for prompt in llm_prompts %}
+      echo ""
+      echo "=== Prompt {{ loop.index }}: {{ prompt }} ==="
+      echo ""
+      ollama run {{ llm_model }} "{{ prompt }}"
+      {% endfor %}
+
+- name: Create LLM Pod manifest
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: "{{ llm_name }}"
+        namespace: "{{ llm_namespace }}"
+        labels:
+          app: nvidia-gpu-llm
+          model: "{{ llm_model }}"
+      spec:
+        restartPolicy: "{{ 'Always' if llm_keep_alive else 'Never' }}"
+        containers:
+          - name: ollama-llm
+            image: ollama/ollama:latest
+            imagePullPolicy: "{{ llm_image_pull_policy }}"
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -e
+                echo "=== Starting Ollama server ==="
+                ollama serve &
+                OLLAMA_PID=$!
+                
+                echo "Waiting for Ollama to start..."
+                sleep 10
+                
+                echo ""
+                echo "=== GPU Detection ==="
+                nvidia-smi -L
+                nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+                echo ""
+                
+                echo "=== Pulling {{ llm_model }} model ==="
+                ollama pull {{ llm_model }}
+                
+                {{ prompts_script }}
+                
+                echo ""
+                echo "=== Model info ==="
+                ollama list
+                
+                echo ""
+                echo "=== Ollama server ready ==="
+                echo "Pod name: {{ llm_name }}"
+                echo "Model: {{ llm_model }}"
+                echo "API endpoint: http://{{ llm_name }}:11434 (if service enabled)"
+                echo ""
+                echo "To interact:"
+                echo "  kubectl exec -it {{ llm_name }} -n {{ llm_namespace }} -- ollama run {{ llm_model }}"
+                echo ""
+                
+                {% if llm_keep_alive %}
+                # Keep alive
+                wait $OLLAMA_PID
+                {% else %}
+                # Exit after prompts
+                echo "Tasks completed. Pod will terminate."
+                {% endif %}
+            resources:
+              limits:
+                nvidia.com/gpu: {{ llm_gpu_count }}
+                memory: "{{ llm_memory }}"
+                cpu: "{{ llm_cpu_cores }}"
+              requests:
+                memory: "{{ (llm_memory | regex_replace('Gi', '') | int / 2) }}Gi"
+                cpu: "{{ llm_cpu_cores // 2 }}"
+            env:
+              - name: OLLAMA_HOST
+                value: "0.0.0.0:11434"
+              - name: NVIDIA_VISIBLE_DEVICES
+                value: "all"
+              - name: NVIDIA_DRIVER_CAPABILITIES
+                value: "compute,utility"
+            {% if llm_persistent_storage | bool %}
+            volumeMounts:
+              - name: model-storage
+                mountPath: /root/.ollama
+            {% endif %}
+        {% if llm_persistent_storage | bool %}
+        volumes:
+          - name: model-storage
+            persistentVolumeClaim:
+              claimName: "{{ llm_name }}-storage"
+        {% endif %}
+
+- name: Create Service for LLM if enabled
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: "{{ llm_name }}-service"
+        namespace: "{{ llm_namespace }}"
+        labels:
+          app: nvidia-gpu-llm
+      spec:
+        selector:
+          app: nvidia-gpu-llm
+        ports:
+          - protocol: TCP
+            port: "{{ llm_service_port }}"
+            targetPort: 11434
+        type: ClusterIP
+  when: llm_service_enabled | bool
+
+- name: Wait for LLM pod to be ready
+  command: kubectl wait --for=condition=ready --timeout=300s pod/{{ llm_name }} -n {{ llm_namespace }}
+  register: pod_ready
+  changed_when: false
+  failed_when: false
+  retries: 3
+  delay: 10
+  until: pod_ready.rc == 0
+
+- name: Get LLM pod status
+  command: kubectl get pod {{ llm_name }} -n {{ llm_namespace }} -o json
+  register: llm_pod_status
+  changed_when: false
+
+- name: Parse pod status
+  set_fact:
+    pod_phase: "{{ (llm_pod_status.stdout | from_json).status.phase }}"
+    pod_ready_status: "{{ (llm_pod_status.stdout | from_json).status.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('False') }}"
+
+- name: Display LLM deployment status
+  debug:
+    msg:
+      - "LLM Pod: {{ llm_name }}"
+      - "Namespace: {{ llm_namespace }}"
+      - "Model: {{ llm_model }}"
+      - "Phase: {{ pod_phase }}"
+      - "Ready: {{ pod_ready_status }}"
+      - "GPU Count: {{ llm_gpu_count }}"
+
+- name: Check LLM pod logs for GPU assignment
+  command: kubectl logs {{ llm_name }} -n {{ llm_namespace }} --tail=50
+  register: llm_logs
+  changed_when: false
+  failed_when: false
+
+- name: Verify GPU was assigned
+  assert:
+    that:
+      - "'NVIDIA' in llm_logs.stdout or 'nvidia' in llm_logs.stdout"
+    fail_msg: "GPU may not have been assigned to the pod"
+    success_msg: "GPU successfully assigned to LLM pod"
+  when: llm_logs.rc == 0
+
+- name: Display completion message
+  debug:
+    msg:
+      - "✓ NVIDIA GPU LLM deployed successfully!"
+      - "  Pod: {{ llm_name }}"
+      - "  Model: {{ llm_model }}"
+      - "  GPU: {{ llm_gpu_count }}x NVIDIA GPU"
+      - ""
+      - "To interact with the model:"
+      - "  kubectl exec -it {{ llm_name }} -n {{ llm_namespace }} -- ollama run {{ llm_model }}"
+      - ""
+      - "To view logs:"
+      - "  kubectl logs -f {{ llm_name }} -n {{ llm_namespace }}"

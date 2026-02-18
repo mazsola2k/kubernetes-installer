@@ -1,0 +1,157 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nvidiagpullms.infra.example.com
+spec:
+  group: infra.example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - action
+                - llmName
+              properties:
+                action:
+                  type: string
+                  description: "Action to perform"
+                  enum: ["install", "status", "uninstall"]
+                  default: "install"
+                llmName:
+                  type: string
+                  description: "Name of the LLM deployment"
+                namespace:
+                  type: string
+                  description: "Namespace for the LLM pod"
+                  default: "default"
+                model:
+                  type: string
+                  description: "Ollama model name"
+                  default: "tinyllama"
+                  enum:
+                    - "tinyllama"
+                    - "llama2"
+                    - "llama2:7b"
+                    - "llama2:13b"
+                    - "mistral"
+                    - "phi"
+                    - "codellama"
+                gpuCount:
+                  type: integer
+                  description: "Number of GPUs to allocate"
+                  default: 1
+                  minimum: 1
+                memory:
+                  type: string
+                  description: "Memory limit for the pod"
+                  default: "4Gi"
+                cpuCores:
+                  type: integer
+                  description: "Number of CPU cores"
+                  default: 2
+                serviceEnabled:
+                  type: boolean
+                  description: "Expose LLM as a service"
+                  default: false
+                servicePort:
+                  type: integer
+                  description: "Service port for Ollama API"
+                  default: 11434
+                prompts:
+                  type: array
+                  description: "Initial prompts to run on startup"
+                  items:
+                    type: string
+                  default:
+                    - "Explain what is Kubernetes in one sentence."
+                persistentStorage:
+                  type: boolean
+                  description: "Enable persistent storage for models"
+                  default: false
+                storageSize:
+                  type: string
+                  description: "Persistent volume size"
+                  default: "10Gi"
+                imagePullPolicy:
+                  type: string
+                  description: "Image pull policy"
+                  default: "IfNotPresent"
+                  enum: ["Always", "IfNotPresent", "Never"]
+                keepAlive:
+                  type: boolean
+                  description: "Keep pod running after initial prompts"
+                  default: true
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: "Current phase of the LLM deployment"
+                  enum: ["Pending", "InProgress", "Ready", "Failed", "Terminating", "Unknown"]
+                message:
+                  type: string
+                  description: "Human-readable status message"
+                reason:
+                  type: string
+                  description: "Short reason code for current phase"
+                observedGeneration:
+                  type: integer
+                  description: "Last observed generation"
+                podName:
+                  type: string
+                  description: "Name of the deployed pod"
+                modelLoaded:
+                  type: string
+                  description: "Currently loaded model"
+                gpuAssigned:
+                  type: boolean
+                  description: "Whether GPU was successfully assigned"
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Model
+          type: string
+          jsonPath: .spec.model
+        - name: GPU
+          type: integer
+          jsonPath: .spec.gpuCount
+        - name: Action
+          type: string
+          jsonPath: .spec.action
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: nvidiagpullms
+    singular: nvidiagpullm
+    kind: NvidiaGpuLlm
+    shortNames:
+      - gpullm
+      - llm
