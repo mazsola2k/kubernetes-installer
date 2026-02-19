@@ -47,7 +47,15 @@
       register: vm_stop_result
       ignore_errors: true
 
-    - name: Wait for VMI to stop
+    - name: Strip foregroundDeleteVirtualMachine finalizer from VMI (prevents hang on Succeeded phase)
+      ansible.builtin.shell: |
+        if kubectl get vmi {{ vm_name }} -n {{ kubevirt_namespace }} &>/dev/null; then
+          kubectl patch vmi {{ vm_name }} -n {{ kubevirt_namespace }} \
+            --type=merge -p '{"metadata":{"finalizers":[]}}' || true
+        fi
+      ignore_errors: true
+
+    - name: Wait for VMI to stop (up to 60s)
       kubernetes.core.k8s_info:
         api_version: kubevirt.io/v1
         kind: VirtualMachineInstance
@@ -55,20 +63,27 @@
         namespace: "{{ kubevirt_namespace }}"
       register: vmi_stop_status
       until: vmi_stop_status.resources | length == 0
-      retries: 20
+      retries: 6
       delay: 10
       ignore_errors: true
 
+    - name: Force delete VMI if still present after timeout
+      ansible.builtin.shell: |
+        if kubectl get vmi {{ vm_name }} -n {{ kubevirt_namespace }} &>/dev/null; then
+          echo "VMI still present, force deleting..."
+          kubectl delete vmi {{ vm_name }} -n {{ kubevirt_namespace }} --force --grace-period=0 || true
+        else
+          echo "VMI already gone"
+        fi
+      ignore_errors: true
+
     - name: Delete VirtualMachine
-      kubernetes.core.k8s:
-        api_version: kubevirt.io/v1
-        kind: VirtualMachine
-        name: "{{ vm_name }}"
-        namespace: "{{ kubevirt_namespace }}"
-        state: absent
-        wait: true
-        wait_timeout: 120
-      when: existing_vm.resources | length > 0
+      ansible.builtin.shell: |
+        if kubectl get vm {{ vm_name }} -n {{ kubevirt_namespace }} &>/dev/null; then
+          kubectl delete vm {{ vm_name }} -n {{ kubevirt_namespace }} --force --grace-period=0 || true
+        else
+          echo "VM already gone"
+        fi
       ignore_errors: true
 
 - name: Remove services
@@ -88,35 +103,30 @@
     state: absent
   ignore_errors: true
 
-- name: Remove PersistentVolumeClaims
-  kubernetes.core.k8s:
-    api_version: v1
-    kind: PersistentVolumeClaim
-    name: "{{ item }}"
-    namespace: "{{ kubevirt_namespace }}"
-    state: absent
-    wait: true
-    wait_timeout: 60
-  loop:
-    - "{{ vm_name }}-system-pvc"
-    - "{{ vm_name }}-installer-iso-pvc"
-    - "{{ vm_name }}-autounattend-pvc"
-    - "{{ vm_name }}-virtio-iso-pvc"
+- name: Remove PersistentVolumeClaims (patch finalizers first to unblock deletion)
+  ansible.builtin.shell: |
+    for pvc in {{ vm_name }}-system-pvc {{ vm_name }}-installer-iso-pvc {{ vm_name }}-autounattend-pvc {{ vm_name }}-virtio-iso-pvc; do
+      if kubectl get pvc $pvc -n {{ kubevirt_namespace }} &>/dev/null; then
+        echo "Removing finalizers and deleting PVC $pvc"
+        kubectl patch pvc $pvc -n {{ kubevirt_namespace }} -p '{"metadata":{"finalizers":[]}}' --type=merge || true
+        kubectl delete pvc $pvc -n {{ kubevirt_namespace }} --force --grace-period=0 || true
+      else
+        echo "PVC $pvc already gone"
+      fi
+    done
   ignore_errors: true
 
-- name: Remove PersistentVolumes
-  kubernetes.core.k8s:
-    api_version: v1
-    kind: PersistentVolume
-    name: "{{ item }}"
-    state: absent
-    wait: true
-    wait_timeout: 60
-  loop:
-    - "{{ vm_name }}-system-pv"
-    - "{{ vm_name }}-installer-iso-pv"
-    - "{{ vm_name }}-autounattend-pv"
-    - "{{ vm_name }}-virtio-iso-pv"
+- name: Remove PersistentVolumes (force)
+  ansible.builtin.shell: |
+    for pv in {{ vm_name }}-system-pv {{ vm_name }}-installer-iso-pv {{ vm_name }}-autounattend-pv {{ vm_name }}-virtio-iso-pv; do
+      if kubectl get pv $pv &>/dev/null; then
+        echo "Deleting PV $pv"
+        kubectl patch pv $pv -p '{"metadata":{"finalizers":[]}}' --type=merge || true
+        kubectl delete pv $pv --force --grace-period=0 || true
+      else
+        echo "PV $pv already gone"
+      fi
+    done
   ignore_errors: true
 
 - name: Remove local storage directories

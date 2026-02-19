@@ -461,9 +461,14 @@
                   -->
                   <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
-                    <Description>Install VirtIO drivers via PS1 embedded in autounattend ISO</Description>
+                    <Description>Install VirtIO drivers - self-contained PowerShell drive scan</Description>
                     <RequiresUserInput>false</RequiresUserInput>
-                    <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$dst='C:\Windows\Temp\Install-VirtIO-w11.ps1'; foreach ($l in [char[]]([char]'D'..[char]'Z')) { $src=$l+':\Install-VirtIO-w11.ps1'; if (Test-Path $src) { Copy-Item $src $dst -Force; break } }; if (Test-Path $dst) { &amp; $dst }"</CommandLine>
+                    <!--
+                      Self-contained: uses Get-Volume to find the CDROM that has NetKVM on it.
+                      Avoids [char] range casting bug (char arithmetic gives int, not string letter).
+                      Writes C:\virtio-install.log so you can verify it ran.
+                    -->
+                    <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$log='C:\virtio-install.log'; Add-Content $log 'VirtIO install starting'; $v=Get-Volume|Where-Object{$_.DriveLetter -and (Test-Path ($_.DriveLetter+':\NetKVM'))}|Select-Object -First 1; if($v){$r=$v.DriveLetter+':'; Add-Content $log ('VirtIO drive: '+$r); foreach($d in 'NetKVM','vioscsi','viostor','Balloon','vioinput','viorng','pvpanic','vioserial','viogpu','viofs','viosock'){$p=$r+'\'+$d+'\w11\amd64'; if(Test-Path $p){Add-Content $log ('Installing: '+$d); pnputil /add-driver ($p+'\*.inf') /subdirs /install}}; pnputil /scan-devices; Add-Content $log 'VirtIO install done'}else{Add-Content $log 'VirtIO ISO not found on any drive'}"</CommandLine>
                   </SynchronousCommand>
                   <SynchronousCommand wcm:action="add">
                     <Order>2</Order>
