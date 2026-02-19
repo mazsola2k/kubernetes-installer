@@ -357,6 +357,9 @@
                 <ImageInstall>
                   <OSImage>
                     <WillShowUI>Never</WillShowUI>
+                    <!-- Upgrade=false forces a clean install, suppresses the
+                         "upgrade or clean install?" popup when prior OS detected -->
+                    <Upgrade>false</Upgrade>
                     <InstallFrom>
                       <!-- Select Windows 11 Pro by exact image name in install.wim -->
                       <MetaData wcm:action="add">
