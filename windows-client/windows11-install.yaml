@@ -1,0 +1,954 @@
+---
+# Windows 11 Client Install Tasks
+# No Vault integration - credentials passed directly via variables.
+# Customised from windows-server-2025-install.yaml for Windows 11 Pro/Enterprise.
+
+- name: Set kubevirt_namespace default if not provided
+  ansible.builtin.set_fact:
+    kubevirt_namespace: "{{ kubevirt_namespace | default('default') }}"
+    kubevirt_operator_namespace: "kubevirt"
+  tags: always
+
+- name: Set vm_name default
+  ansible.builtin.set_fact:
+    vm_name: "{{ vmName | default('win11client') }}"
+  tags: always
+
+# ============================================================
+# Pre-flight checks
+# ============================================================
+- name: Pre-flight checks
+  block:
+    - name: Check if Windows 11 ISO file exists
+      ansible.builtin.stat:
+        path: "{{ iso_path | default('./win11client.iso') }}"
+      register: iso_file_check
+
+    - name: Download Windows 11 ISO if not present (with progress)
+      progress_get_url:
+        url: "{{ iso_download_url | default('https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-gb.iso') }}"
+        dest: "{{ iso_path | default('./win11client.iso') }}"
+        mode: '0644'
+        timeout: 1800
+      when: not iso_file_check.stat.exists
+      register: iso_download_result
+
+    - name: Re-check ISO file after potential download
+      ansible.builtin.stat:
+        path: "{{ iso_path | default('./win11client.iso') }}"
+      register: iso_file_final_check
+      failed_when: not iso_file_final_check.stat.exists
+
+    - name: Display ISO file information
+      ansible.builtin.debug:
+        msg:
+          - "Windows 11 ISO found: {{ iso_path | default('./win11client.iso') }}"
+          - "Size: {{ (iso_file_final_check.stat.size / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "{{ 'Downloaded' if (iso_download_result is defined and iso_download_result.changed | default(false)) else 'Using existing local file' }}"
+
+    - name: Ensure VM target namespace exists
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ kubevirt_namespace }}"
+        state: present
+
+    - name: Check if KubeVirt operator is deployed and ready
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: KubeVirt
+        name: kubevirt
+        namespace: "{{ kubevirt_operator_namespace }}"
+      register: kubevirt_status
+      failed_when:
+        - kubevirt_status.resources | length == 0 or
+          kubevirt_status.resources[0].status.phase != "Deployed"
+
+    - name: Display KubeVirt status
+      ansible.builtin.debug:
+        msg: "✅ KubeVirt is ready: {{ kubevirt_status.resources[0].status.phase }}"
+
+# ============================================================
+# Check for existing installation
+# ============================================================
+- name: Check for existing installation
+  block:
+    - name: Check if Windows 11 VM already exists
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: existing_vm
+
+    - name: Display existing installation warning
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  WARNING: Windows 11 VM '{{ vm_name }}' already exists!"
+          - "Status: {{ existing_vm.resources[0].status.printableStatus | default('Unknown') }}"
+          - "Proceeding with installation anyway - this may cause conflicts"
+      when: existing_vm.resources | length > 0
+
+# ============================================================
+# Storage preparation
+# ============================================================
+- name: Storage preparation
+  block:
+    - name: Ensure qemu-img is installed
+      ansible.builtin.package:
+        name: qemu-img
+        state: present
+
+    - name: Ensure parted is installed
+      ansible.builtin.package:
+        name: parted
+        state: present
+
+    - name: Create base storage directory
+      ansible.builtin.file:
+        path: "{{ storage_dir | default('/var/lib/kubevirt') }}"
+        state: directory
+        mode: '0755'
+
+    - name: Check available disk space
+      ansible.builtin.shell: |
+        df -h {{ storage_dir | default('/var/lib/kubevirt') }} | tail -1 | awk '{print $4}'
+      register: available_space
+      changed_when: false
+
+    - name: Display storage information
+      ansible.builtin.debug:
+        msg:
+          - "📁 Storage directory: {{ storage_dir | default('/var/lib/kubevirt') }}"
+          - "💾 Available space: {{ available_space.stdout }}"
+          - "� ISO file size: {{ (iso_file_final_check.stat.size / 1024 / 1024 / 1024) | round(2) }} GB"
+
+    - name: Ensure xorriso is installed (needed for mkisofs-compatible ISO creation)
+      ansible.builtin.package:
+        name: xorriso
+        state: present
+
+    - name: Ensure dosfstools is installed (needed for mkfs.vfat)
+      ansible.builtin.package:
+        name: dosfstools
+        state: present
+
+    - name: Create directory structure for storage
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-system-disk"
+        - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-installer-iso"
+        - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-autounattend"
+        - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-virtio-iso"
+
+    - name: Stage Windows 11 ISO to installer-iso storage directory
+      ansible.builtin.shell: |
+        SRC="$ISO_PATH"
+        DST="$STORAGE_DIR/$VM_NAME-installer-iso/disk.img"
+        if [ -f "$DST" ] && [ "$(stat -c%s "$DST")" -eq "$(stat -c%s "$SRC")" ]; then
+          echo "ISO already staged (same size), skipping"
+          exit 0
+        fi
+        echo "Staging ISO: $SRC -> $DST"
+        cp "$SRC" "$DST"
+        echo "ISO staged successfully"
+      environment:
+        STORAGE_DIR: "{{ storage_dir | default('/var/lib/kubevirt') }}"
+        VM_NAME: "{{ vm_name }}"
+        ISO_PATH: "{{ iso_path | default('./win11client.iso') }}"
+      register: iso_stage_result
+      changed_when: "'ISO staged successfully' in iso_stage_result.stdout"
+
+    - name: Check if installer ISO is already staged
+      ansible.builtin.shell: |
+        test -f "$STORAGE_DIR/$VM_NAME-installer-iso/disk.img" && echo "exists" || echo "missing"
+      environment:
+        STORAGE_DIR: "{{ storage_dir | default('/var/lib/kubevirt') }}"
+        VM_NAME: "{{ vm_name }}"
+      register: staged_iso_check
+      changed_when: false
+      failed_when: staged_iso_check.stdout == "missing"
+
+    - name: Create blank system disk (RAW) as Windows 11 installation target
+      ansible.builtin.shell: |
+        DST={{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-system-disk/disk.img
+        SIZE={{ system_disk_size | default('64Gi') | replace('Gi', 'G') | replace('Mi', 'M') | replace('Ti', 'T') }}
+        if [ -f "$DST" ]; then
+          echo "System disk already exists: $DST ($(du -sh $DST | cut -f1))"
+        else
+          echo "Creating blank RAW system disk: $DST (${SIZE})"
+          qemu-img create -f raw "$DST" "$SIZE"
+          echo "Blank system disk created."
+        fi
+      register: system_disk_result
+      changed_when: "'Creating blank' in system_disk_result.stdout"
+
+    - name: Set boot mode to UEFI (required for Windows 11)
+      ansible.builtin.set_fact:
+        boot_mode: "uefi"
+
+# ============================================================
+# Create unattended installation files
+# ============================================================
+- name: Create unattended installation files
+  block:
+    - name: Create Install-VirtIO.ps1 script (Windows 11 edition)
+      ansible.builtin.copy:
+        dest: "{{ storage_dir | default('/var/lib/kubevirt') }}/Install-VirtIO-w11.ps1"
+        mode: '0644'
+        content: |
+          # Install VirtIO drivers for Windows 11
+          $ErrorActionPreference = 'Continue'
+          $log = 'C:\Windows\Temp\virtio-install.log'
+          try { Start-Transcript -Path $log -Append -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+          function Get-VirtioRoot {
+            if (Test-Path 'D:\NetKVM') { return 'D:\' }
+            $deadline = (Get-Date).AddMinutes(5)
+            do {
+              foreach ($l in 'D','E','F','G','H','I','J','K') {
+                $root = "$l:\"
+                if (Test-Path (Join-Path $root 'NetKVM')) { return $root }
+              }
+              Start-Sleep -Seconds 5
+            } while ((Get-Date) -lt $deadline)
+            return $null
+          }
+
+          $root = Get-VirtioRoot
+          if (-not $root) {
+            Write-Host 'VirtIO ISO not found - skipping driver install.'
+          } else {
+            Write-Host "Using VirtIO root: $root"
+            # NetKVM first (networking)
+            $nk = Join-Path $root 'NetKVM\w11\amd64\netkvm.inf'
+            if (Test-Path $nk) {
+              Write-Host "Installing NetKVM from $nk"
+              pnputil /add-driver "$nk" /install
+            }
+            # Core VirtIO drivers for Windows 11
+            $driverDirs = @('vioscsi','viostor','Balloon','vioinput','viorng','pvpanic','qxldod','vioserial','NetKVM','viogpu','viofs','viosock')
+            foreach ($d in $driverDirs) {
+              $p = Join-Path $root "$d\w11\amd64"
+              if (Test-Path $p) {
+                Write-Host "Installing drivers from $p"
+                pnputil /add-driver (Join-Path $p '*.inf') /subdirs /install
+              }
+            }
+            Write-Host "Final DISM sweep under $root"
+            & dism.exe /online /add-driver /driver:"$root" /recurse
+          }
+          try { pnputil /scan-devices } catch {}
+          try { Stop-Transcript } catch {}
+
+    - name: Create SetupComplete.cmd for Windows 11
+      ansible.builtin.copy:
+        dest: "{{ storage_dir | default('/var/lib/kubevirt') }}/SetupComplete-w11.cmd"
+        mode: '0644'
+        content: |
+          @echo off
+          if not exist C:\Windows\Setup\Scripts mkdir C:\Windows\Setup\Scripts
+          if not exist C:\Windows\Temp\Install-VirtIO-w11.ps1 (
+            for %%%%L in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+              if exist %%%%L:\Install-VirtIO-w11.ps1 (
+                copy /Y %%%%L:\Install-VirtIO-w11.ps1 C:\Windows\Temp\Install-VirtIO-w11.ps1
+                goto :copied
+              )
+            )
+          )
+          :copied
+          powershell -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\Install-VirtIO-w11.ps1
+
+    - name: Create Autounattend.xml for Windows 11
+      ansible.builtin.copy:
+        dest: "{{ storage_dir | default('/var/lib/kubevirt') }}/Autounattend-w11.xml"
+        mode: '0644'
+        content: |
+          <?xml version="1.0" encoding="utf-8"?>
+          <unattend xmlns="urn:schemas-microsoft-com:unattend">
+            <settings pass="windowsPE">
+              <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         name="Microsoft-Windows-International-Core-WinPE"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <SetupUILanguage>
+                  <UILanguage>en-GB</UILanguage>
+                </SetupUILanguage>
+                <InputLocale>en-GB</InputLocale>
+                <SystemLocale>en-GB</SystemLocale>
+                <UILanguage>en-GB</UILanguage>
+                <UserLocale>en-GB</UserLocale>
+              </component>
+              <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         name="Microsoft-Windows-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <!--
+                  LabConfig registry keys bypass TPM 2.0 / Secure Boot / RAM checks
+                  allowing Windows 11 to install in KubeVirt without a physical TPM.
+                -->
+                <RunSynchronous>
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+                  </RunSynchronousCommand>
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+                  </RunSynchronousCommand>
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>3</Order>
+                    <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+                  </RunSynchronousCommand>
+                </RunSynchronous>
+                <!-- DiskConfiguration: WillWipeDisk omitted (defaults false).
+                     The target disk is always a fresh blank RAW image so there is nothing
+                     to wipe and Windows 11 will not show a confirmation dialog. -->
+                <DiskConfiguration>
+                  <Disk wcm:action="add">
+                    <CreatePartitions>
+                      <CreatePartition wcm:action="add">
+                        <Order>1</Order>
+                        <Type>EFI</Type>
+                        <Size>500</Size>
+                      </CreatePartition>
+                      <CreatePartition wcm:action="add">
+                        <Order>2</Order>
+                        <Type>MSR</Type>
+                        <Size>128</Size>
+                      </CreatePartition>
+                      <CreatePartition wcm:action="add">
+                        <Order>3</Order>
+                        <Type>Primary</Type>
+                        <Extend>true</Extend>
+                      </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                      <ModifyPartition wcm:action="add">
+                        <Format>FAT32</Format>
+                        <Label>System</Label>
+                        <Order>1</Order>
+                        <PartitionID>1</PartitionID>
+                      </ModifyPartition>
+                      <ModifyPartition wcm:action="add">
+                        <Order>2</Order>
+                        <PartitionID>2</PartitionID>
+                      </ModifyPartition>
+                      <ModifyPartition wcm:action="add">
+                        <Format>NTFS</Format>
+                        <Label>Windows</Label>
+                        <Letter>C</Letter>
+                        <Order>3</Order>
+                        <PartitionID>3</PartitionID>
+                      </ModifyPartition>
+                    </ModifyPartitions>
+                    <DiskID>0</DiskID>
+                  </Disk>
+                </DiskConfiguration>
+                <ImageInstall>
+                  <OSImage>
+                    <WillShowUI>Never</WillShowUI>
+                    <InstallFrom>
+                      <!-- Select Windows 11 Pro by exact image name in install.wim -->
+                      <MetaData wcm:action="add">
+                        <Key>/IMAGE/NAME</Key>
+                        <Value>Windows 11 Pro</Value>
+                      </MetaData>
+                    </InstallFrom>
+                    <InstallTo>
+                      <DiskID>0</DiskID>
+                      <PartitionID>3</PartitionID>
+                    </InstallTo>
+                  </OSImage>
+                </ImageInstall>
+                <UserData>
+                  <AcceptEula>true</AcceptEula>
+                  <FullName>Administrator</FullName>
+                  <Organization>Lab</Organization>
+                  <ProductKey>
+                    <!-- Skip product key screen - key can be entered inside Windows later -->
+                    <WillShowUI>Never</WillShowUI>
+                  </ProductKey>
+                </UserData>
+                <!-- No DriverPaths needed: disk0 uses SATA bus which Windows PE supports natively.
+                     VirtIO drivers (NetKVM, Balloon, etc.) are installed post-boot via FirstLogonCommands. -->
+              </component>
+            </settings>
+            <settings pass="specialize">
+              <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         name="Microsoft-Windows-Shell-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <ComputerName>WIN11-CLIENT</ComputerName>
+                <CopyProfile>false</CopyProfile>
+              </component>
+            </settings>
+            <settings pass="oobeSystem">
+              <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         name="Microsoft-Windows-International-Core"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <InputLocale>en-GB</InputLocale>
+                <SystemLocale>en-GB</SystemLocale>
+                <UILanguage>en-GB</UILanguage>
+                <UserLocale>en-GB</UserLocale>
+              </component>
+              <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         name="Microsoft-Windows-Shell-Setup"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <TimeZone>UTC</TimeZone>
+                <UserAccounts>
+                  <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                      <Password>
+                        <Value>{{ windows_admin_password | default('SecureP@ssw0rd!') }}</Value>
+                        <PlainText>true</PlainText>
+                      </Password>
+                      <Description>Local Administrator</Description>
+                      <DisplayName>Administrator</DisplayName>
+                      <Group>Administrators</Group>
+                      <Name>Administrator</Name>
+                    </LocalAccount>
+                  </LocalAccounts>
+                </UserAccounts>
+                <AutoLogon>
+                  <Enabled>true</Enabled>
+                  <LogonCount>3</LogonCount>
+                  <Domain>.</Domain>
+                  <Username>Administrator</Username>
+                  <Password>
+                    <Value>{{ windows_admin_password | default('SecureP@ssw0rd!') }}</Value>
+                    <PlainText>true</PlainText>
+                  </Password>
+                </AutoLogon>
+                <OOBE>
+                  <HideEULAPage>true</HideEULAPage>
+                  <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                  <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                  <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                  <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                  <NetworkLocation>Work</NetworkLocation>
+                  <ProtectYourPC>1</ProtectYourPC>
+                  <SkipMachineOOBE>true</SkipMachineOOBE>
+                  <SkipUserOOBE>true</SkipUserOOBE>
+                </OOBE>
+                <FirstLogonCommands>
+                  <!--
+                    Order 1: Find Install-VirtIO-w11.ps1 on any drive D..Z using PowerShell.
+                    The script is embedded in the autounattend ISO (alongside Autounattend.xml),
+                    so it is accessible inside the VM regardless of which drive letter Windows assigns.
+                    Get-VirtioRoot inside the PS1 then scans independently for the VirtIO ISO.
+                    PowerShell drive-letter loop avoids the broken cmd.exe goto-in-for-loop behaviour.
+                  -->
+                  <SynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Description>Install VirtIO drivers via PS1 embedded in autounattend ISO</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                    <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$dst='C:\Windows\Temp\Install-VirtIO-w11.ps1'; foreach ($l in [char[]]([char]'D'..[char]'Z')) { $src=$l+':\Install-VirtIO-w11.ps1'; if (Test-Path $src) { Copy-Item $src $dst -Force; break } }; if (Test-Path $dst) { &amp; $dst }"</CommandLine>
+                  </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <Description>Enable Remote Desktop</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                    <CommandLine>reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f</CommandLine>
+                  </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>3</Order>
+                    <Description>Allow RDP through firewall</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                    <CommandLine>netsh advfirewall firewall set rule group="remote desktop" new enable=Yes</CommandLine>
+                  </SynchronousCommand>
+                  <SynchronousCommand wcm:action="add">
+                    <Order>4</Order>
+                    <Description>Enable WinRM and open firewall ports</Description>
+                    <RequiresUserInput>false</RequiresUserInput>
+                    <CommandLine>powershell -Command "winrm quickconfig -quiet; winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}'; winrm set winrm/config/service/auth '@{Basic=\"true\"}'; Enable-PSRemoting -Force -SkipNetworkProfileCheck; New-NetFirewallRule -DisplayName 'Allow RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any; New-NetFirewallRule -DisplayName 'Allow WinRM HTTP' -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any"</CommandLine>
+                  </SynchronousCommand>
+                </FirstLogonCommands>
+              </component>
+            </settings>
+          </unattend>
+
+    - name: Create ISO9660 answer disk with Autounattend.xml (Windows PE requires ISO9660, not FAT)
+      ansible.builtin.shell: |
+        IMG="$STORAGE_DIR/$VM_NAME-autounattend/disk.img"
+        XML="$STORAGE_DIR/Autounattend-w11.xml"
+        # Rebuild if missing or XML is newer
+        if [ -f "$IMG" ] && [ "$IMG" -nt "$XML" ]; then
+          echo "Answer ISO is up-to-date, skipping"
+          exit 0
+        fi
+        echo "Creating ISO9660 answer disk with Autounattend.xml"
+        TMPDIR=$(mktemp -d)
+        cp "$XML" "$TMPDIR/Autounattend.xml"
+        # Also embed Install-VirtIO-w11.ps1 so FirstLogonCommands can find it inside the VM
+        if [ -f "$SCRIPT" ]; then
+          cp "$SCRIPT" "$TMPDIR/Install-VirtIO-w11.ps1"
+        fi
+        xorriso -as mkisofs \
+          -iso-level 4 \
+          -full-iso9660-filenames \
+          -joliet -joliet-long \
+          -rational-rock \
+          -volid AUTOUNATTD \
+          -o "$IMG" \
+          "$TMPDIR"
+        rm -rf "$TMPDIR"
+        echo "Answer ISO created: $IMG"
+      environment:
+        STORAGE_DIR: "{{ storage_dir | default('/var/lib/kubevirt') }}"
+        VM_NAME: "{{ vm_name }}"
+        SCRIPT: "{{ storage_dir | default('/var/lib/kubevirt') }}/Install-VirtIO-w11.ps1"
+      register: autounattend_disk_result
+      changed_when: "'Answer ISO created' in autounattend_disk_result.stdout"
+
+    - name: Load Autounattend.xml content
+      ansible.builtin.slurp:
+        src: "{{ storage_dir | default('/var/lib/kubevirt') }}/Autounattend-w11.xml"
+      register: unattend_slurped
+
+    - name: Load Install-VirtIO.ps1 content
+      ansible.builtin.slurp:
+        src: "{{ storage_dir | default('/var/lib/kubevirt') }}/Install-VirtIO-w11.ps1"
+      register: install_ps1_slurped
+
+    - name: Load SetupComplete.cmd content
+      ansible.builtin.slurp:
+        src: "{{ storage_dir | default('/var/lib/kubevirt') }}/SetupComplete-w11.cmd"
+      register: setupcomplete_slurped
+
+    - name: Set default VirtIO ISO download URL
+      ansible.builtin.set_fact:
+        virtio_iso_download_url: "{{ virtio_iso_url | default('https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win.iso') }}"
+
+    - name: Check if VirtIO ISO already exists locally
+      ansible.builtin.stat:
+        path: "./virtio-win.iso"
+      register: virtio_iso_local_exists
+
+    - name: Check if VirtIO ISO already staged in storage directory
+      ansible.builtin.stat:
+        path: "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-virtio-iso/disk.img"
+      register: virtio_iso_storage_exists
+
+    - name: Download VirtIO ISO if not present (with progress)
+      progress_get_url:
+        url: "{{ virtio_iso_download_url }}"
+        dest: "./virtio-win.iso"
+        mode: '0644'
+        timeout: 1800
+      when:
+        - virtio_iso_path is not defined
+        - not virtio_iso_local_exists.stat.exists
+      register: virtio_iso_download_result
+
+    - name: Copy VirtIO ISO to storage directory
+      ansible.builtin.copy:
+        src: "./virtio-win.iso"
+        dest: "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-virtio-iso/disk.img"
+        mode: '0644'
+        force: yes
+      when:
+        - virtio_iso_path is not defined
+        - virtio_iso_local_exists.stat.exists or (virtio_iso_download_result is defined and virtio_iso_download_result.changed)
+
+    - name: Copy VirtIO ISO from custom path if provided
+      ansible.builtin.copy:
+        src: "{{ virtio_iso_path }}"
+        dest: "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-virtio-iso/disk.img"
+        mode: '0644'
+        force: yes
+      when: virtio_iso_path is defined
+
+    - name: Create Sysprep Secret with unattend files
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ vm_name }}-sysprep"
+            namespace: "{{ kubevirt_namespace }}"
+          type: Opaque
+          data:
+            Autounattend.xml: "{{ unattend_slurped.content }}"
+            Unattend.xml: "{{ unattend_slurped.content }}"
+            unattend.xml: "{{ unattend_slurped.content }}"
+            Install-VirtIO-w11.ps1: "{{ install_ps1_slurped.content }}"
+            SetupComplete.cmd: "{{ setupcomplete_slurped.content }}"
+
+    - name: Display unattend configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "📋 Unattend.xml Configuration (Windows 11):"
+          - "  - Admin Password: (set via windows_admin_password var)"
+          - "  - TPM/SecureBoot/RAM bypass: enabled"
+          - "  - Sysprep Secret: {{ vm_name }}-sysprep"
+
+# ============================================================
+# Create Kubernetes storage resources
+# ============================================================
+- name: Create Kubernetes storage resources
+  block:
+    - name: Create local storage class
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: local-storage
+          provisioner: kubernetes.io/no-provisioner
+          volumeBindingMode: WaitForFirstConsumer
+          reclaimPolicy: Retain
+
+    - name: Get node hostname for affinity
+      ansible.builtin.shell: kubectl get nodes -o jsonpath='{.items[0].metadata.name}'
+      register: node_hostname
+      changed_when: false
+
+    - name: Set PV resources
+      ansible.builtin.set_fact:
+        pv_resources:
+          - name: "{{ vm_name }}-system-pv"
+            size: "{{ system_disk_size | default('64Gi') }}"
+            access_modes: ["ReadWriteOnce"]
+            path: "{{ vm_name }}-system-disk"
+            claim_namespace: "{{ kubevirt_namespace }}"
+          - name: "{{ vm_name }}-installer-iso-pv"
+            size: "{{ installer_iso_size | default('8Gi') }}"
+            access_modes: ["ReadOnlyMany"]
+            path: "{{ vm_name }}-installer-iso"
+            claim_namespace: "{{ kubevirt_namespace }}"
+          - name: "{{ vm_name }}-autounattend-pv"
+            size: "100Mi"
+            access_modes: ["ReadOnlyMany"]
+            path: "{{ vm_name }}-autounattend"
+            claim_namespace: "{{ kubevirt_namespace }}"
+          - name: "{{ vm_name }}-virtio-iso-pv"
+            size: "{{ virtio_iso_size | default('2Gi') }}"
+            access_modes: ["ReadOnlyMany"]
+            path: "{{ vm_name }}-virtio-iso"
+            claim_namespace: "{{ kubevirt_namespace }}"
+
+    - name: Create PersistentVolumes
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              type: local
+              app: "{{ vm_name }}"
+          spec:
+            capacity:
+              storage: "{{ item.size }}"
+            accessModes: "{{ item.access_modes }}"
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: local-storage
+            volumeMode: Filesystem
+            hostPath:
+              path: "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ item.path }}"
+              type: Directory
+            nodeAffinity:
+              required:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["{{ node_hostname.stdout }}"]
+      loop: "{{ pv_resources }}"
+
+    - name: Set PVC resources
+      ansible.builtin.set_fact:
+        pvc_resources:
+          - name: "{{ vm_name }}-system-pvc"
+            size: "{{ system_disk_size | default('64Gi') }}"
+            access_modes: ["ReadWriteOnce"]
+            namespace: "{{ kubevirt_namespace }}"
+          - name: "{{ vm_name }}-installer-iso-pvc"
+            size: "{{ installer_iso_size | default('8Gi') }}"
+            access_modes: ["ReadOnlyMany"]
+            namespace: "{{ kubevirt_namespace }}"
+          - name: "{{ vm_name }}-autounattend-pvc"
+            size: "100Mi"
+            access_modes: ["ReadOnlyMany"]
+            namespace: "{{ kubevirt_namespace }}"
+          - name: "{{ vm_name }}-virtio-iso-pvc"
+            size: "{{ virtio_iso_size | default('2Gi') }}"
+            access_modes: ["ReadOnlyMany"]
+            namespace: "{{ kubevirt_namespace }}"
+
+    - name: Create PersistentVolumeClaims
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ item.namespace }}"
+          spec:
+            accessModes: "{{ item.access_modes }}"
+            resources:
+              requests:
+                storage: "{{ item.size }}"
+            storageClassName: local-storage
+            volumeMode: Filesystem
+      loop: "{{ pvc_resources }}"
+
+# ============================================================
+# Deploy Windows 11 VM
+# ============================================================
+- name: Deploy Windows 11 VM
+  block:
+    - name: Build VirtualMachine definition (UEFI, Windows 11)
+      ansible.builtin.set_fact:
+        vm_definition:
+          apiVersion: kubevirt.io/v1
+          kind: VirtualMachine
+          metadata:
+            name: "{{ vm_name }}"
+            namespace: "{{ kubevirt_namespace }}"
+            labels:
+              app: "{{ vm_name }}"
+              os: windows
+              version: "11"
+          spec:
+            runStrategy: RerunOnFailure
+            template:
+              metadata:
+                labels:
+                  kubevirt.io/vm: "{{ vm_name }}"
+                  os: windows
+                  version: "11"
+              spec:
+                domain:
+                  cpu:
+                    cores: "{{ vm_cpu_cores | default(4) | int }}"
+                    model: "host-passthrough"
+                  resources:
+                    requests:
+                      memory: "{{ vm_memory | default('8Gi') }}"
+                  memory:
+                    guest: "{{ vm_memory | default('8Gi') }}"
+                  machine:
+                    type: q35
+                  firmware:
+                    bootloader:
+                      efi:
+                        # SecureBoot disabled for KubeVirt compatibility; TPM bypass via LabConfig
+                        secureBoot: false
+                    smm:
+                      enabled: true
+                  features:
+                    acpi: {}
+                    apic: {}
+                    hyperv:
+                      relaxed: {}
+                      vapic: {}
+                      spinlocks:
+                        retries: 8191
+                      synic: {}
+                      vpindex: {}
+                      runtime: {}
+                      reset: {}
+                      freqs: {}
+                      tlbflush: {}
+                      ipi: {}
+                  clock:
+                    timezone: UTC
+                    timer:
+                      hpet:
+                        present: false
+                      pit:
+                        tickPolicy: delay
+                      rtc:
+                        tickPolicy: catchup
+                      hyperv:
+                        present: true
+                  devices:
+                    bootMenu:
+                      enabled: true
+                    autoattachPodInterface: false
+                    autoattachSerialConsole: true
+                    autoattachGraphicsDevice: true
+                    rng: {}
+                    disks:
+                      - name: installer-iso
+                        cdrom:
+                          bus: sata
+                        bootOrder: 1
+                      - name: disk0
+                        disk:
+                          bus: sata
+                        bootOrder: 2
+                      - name: autounattend
+                        cdrom:
+                          bus: sata
+                      - name: virtio-iso
+                        cdrom:
+                          bus: sata
+                        bootOrder: 3
+                      # sysprep CDROM omitted during install phase - it injects a second
+                      # Autounattend.xml that can confuse Windows PE answer file precedence.
+                    interfaces:
+                      - name: default
+                        masquerade: {}
+                        model: virtio
+                    inputs:
+                      - type: tablet
+                        bus: usb
+                        name: tablet
+                networks:
+                  - name: default
+                    pod: {}
+                volumes:
+                  - name: installer-iso
+                    persistentVolumeClaim:
+                      claimName: "{{ vm_name }}-installer-iso-pvc"
+                  - name: disk0
+                    persistentVolumeClaim:
+                      claimName: "{{ vm_name }}-system-pvc"
+                  - name: autounattend
+                    persistentVolumeClaim:
+                      claimName: "{{ vm_name }}-autounattend-pvc"
+                  - name: virtio-iso
+                    persistentVolumeClaim:
+                      claimName: "{{ vm_name }}-virtio-iso-pvc"
+
+    - name: Create Windows 11 VirtualMachine
+      kubernetes.core.k8s:
+        definition: "{{ vm_definition }}"
+        state: present
+        wait: false
+      register: vm_creation_result
+
+    - name: Create VNC access service (NodePort)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}-vnc"
+            namespace: "{{ kubevirt_namespace }}"
+            labels:
+              app: "{{ vm_name }}"
+          spec:
+            type: NodePort
+            selector:
+              kubevirt.io/vm: "{{ vm_name }}"
+            ports:
+              - name: vnc
+                port: 5900
+                targetPort: 5900
+                protocol: TCP
+
+    - name: Create RDP access service (NodePort)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}-rdp"
+            namespace: "{{ kubevirt_namespace }}"
+            labels:
+              app: "{{ vm_name }}"
+          spec:
+            type: NodePort
+            selector:
+              kubevirt.io/vm: "{{ vm_name }}"
+            ports:
+              - name: rdp
+                port: 3389
+                targetPort: 3389
+                protocol: TCP
+
+    - name: Create WinRM access service (ClusterIP)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}-winrm"
+            namespace: "{{ kubevirt_namespace }}"
+            labels:
+              app: "{{ vm_name }}"
+          spec:
+            type: ClusterIP
+            selector:
+              kubevirt.io/vm: "{{ vm_name }}"
+            ports:
+              - name: winrm
+                port: 5985
+                targetPort: 5985
+                protocol: TCP
+
+    - name: Wait for VM to be created
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        namespace: "{{ kubevirt_namespace }}"
+      register: deployed_vm
+      until: deployed_vm.resources | length > 0
+      retries: 10
+
+    - name: Wait for VM instance to start
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: vmi_status
+      until:
+        - vmi_status.resources | length > 0
+        - vmi_status.resources[0].status.phase in ["Running", "Scheduled"]
+      retries: 30
+      delay: 10
+
+    - name: Display installation results
+      ansible.builtin.debug:
+        msg:
+          - "🎉 Windows 11 VM Installation Complete!"
+          - ""
+          - "📊 Status:"
+          - "  VM Status: {{ deployed_vm.resources[0].status.printableStatus | default('Created') }}"
+          - "  VMI Phase: {{ vmi_status.resources[0].status.phase | default('Pending') }}"
+          - "  Node: {{ vmi_status.resources[0].status.nodeName | default('Not assigned') }}"
+          - "  IP: {{ vmi_status.resources[0].status.interfaces[0].ipAddress | default('Not assigned yet') }}"
+          - ""
+          - "🖥️  Access commands:"
+          - "  VNC:     virtctl vnc {{ vm_name }} -n {{ kubevirt_namespace }}"
+          - "  Console: virtctl console {{ vm_name }} -n {{ kubevirt_namespace }}"
+          - "  RDP:     kubectl port-forward svc/{{ vm_name }}-rdp 3389:3389 -n {{ kubevirt_namespace }}"
+          - "           Then connect RDP client to localhost:3389"
+          - ""
+          - "💡 Note: Windows 11 ISO-based install: boots from installer-iso CDROM, installs onto blank disk0."
+          - "   First-boot setup takes 15-30 minutes (full ISO install + OOBE)."
+          - "   VirtIO drivers install automatically via Autounattend + FirstLogonCommands."
+          - "   TPM 2.0/SecureBoot requirements are bypassed via LabConfig registry keys."
+          - "   After install completes, remove or detach the installer ISO to prevent re-install on reboot."

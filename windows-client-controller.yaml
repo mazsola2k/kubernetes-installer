@@ -1,0 +1,105 @@
+---
+# Windows Client Controller
+# Manages Windows 11 KubeVirt VM lifecycle (install / uninstall / reinstall / status).
+#
+# Usage:
+#   ansible-playbook windows-client-controller.yaml -e action=install
+#   ansible-playbook windows-client-controller.yaml -e action=status
+#   ansible-playbook windows-client-controller.yaml -e action=uninstall
+#   ansible-playbook windows-client-controller.yaml -e action=reinstall
+#
+# Key variables (override with -e):
+#   vm_name              VM name in Kubernetes (default: win11client)
+#   kubevirt_namespace   Namespace to deploy into (default: default)
+#   windows_admin_password  Local Administrator password (default: SecureP@ssw0rd!)
+#   iso_path             Path to Windows 11 ISO file (default: ./win11client.iso)
+#   iso_download_url     URL to download ISO if not present
+#   vm_cpu_cores         Number of vCPU cores (default: 4)
+#   vm_memory            VM memory (default: 8Gi)
+#   system_disk_size     System disk size (default: 64Gi)
+#   installer_iso_size   PV size for Windows ISO (default: 8Gi)
+#   virtio_iso_path      Optional: custom path to virtio-win.iso
+#   iso_download_url     URL to download ISO if not present
+#   windows 11 urls      https://www.windowscentral.com/microsoft/windows-11/microsofts-official-windows-11-version-25h2-rtm-iso-media-is-now-available-download-all-28-languages-here-for-x64-or-arm64
+
+- name: Windows Client Controller
+  hosts: localhost
+  become: yes
+  vars:
+    kubevirt_operator_namespace: "kubevirt"
+    ansible_python_interpreter: /opt/kubevirt-ansible-venv/bin/python
+
+  tasks:
+    - name: Set default variables
+      ansible.builtin.set_fact:
+        action: "{{ action | default('install') }}"
+        vm_name: "{{ vmName | default('win11client') }}"
+        vm_cpu_cores: "{{ vm_cpu_cores | default(4) | int }}"
+        vm_memory: "{{ vm_memory | default('8Gi') }}"
+        system_disk_size: "{{ system_disk_size | default('64Gi') }}"
+        storage_dir: "{{ storage_dir | default('/var/lib/kubevirt') }}"
+        windows_admin_password: "{{ windows_admin_password | default('SecureP@ssw0rd!') }}"
+
+    - name: Set kubevirt_namespace default if not provided
+      ansible.builtin.set_fact:
+        kubevirt_namespace: "{{ kubevirt_namespace | default('default') }}"
+
+    - name: Validate action parameter
+      ansible.builtin.fail:
+        msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, status"
+      when: action not in ['install', 'uninstall', 'reinstall', 'status']
+
+    - name: Display controller banner
+      ansible.builtin.debug:
+        msg:
+          - "🪟 Windows Client Controller"
+          - "Action:    {{ action | upper }}"
+          - "VM Name:   {{ vm_name }}"
+          - "Namespace: {{ kubevirt_namespace }}"
+          - "CPU:       {{ vm_cpu_cores }} cores"
+          - "Memory:    {{ vm_memory }}"
+          - "Disk:      {{ system_disk_size }}"
+
+    # Install
+    - name: Execute Windows 11 installation
+      ansible.builtin.include_tasks: windows-client/windows11-install.yaml
+      when: action == 'install'
+
+    # Uninstall
+    - name: Execute Windows 11 uninstallation
+      ansible.builtin.include_tasks: windows-client/windows11-uninstall.yaml
+      when: action == 'uninstall'
+
+    # Status
+    - name: Execute Windows 11 status check
+      ansible.builtin.include_tasks: windows-client/windows11-status.yaml
+      when: action == 'status'
+
+    # Reinstall (uninstall then install)
+    - name: Execute Windows 11 reinstallation
+      block:
+        - name: Uninstall phase
+          ansible.builtin.include_tasks: windows-client/windows11-uninstall.yaml
+        - name: Pause between uninstall and install
+          ansible.builtin.wait_for:
+            timeout: 15
+        - name: Install phase
+          ansible.builtin.include_tasks: windows-client/windows11-install.yaml
+      when: action == 'reinstall'
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg:
+          - "✅ Windows 11 {{ action | upper }} completed!"
+          - ""
+          - "Commands:"
+          - "  Install:   ansible-playbook windows-client-controller.yaml -e action=install"
+          - "  Status:    ansible-playbook windows-client-controller.yaml -e action=status"
+          - "  Uninstall: ansible-playbook windows-client-controller.yaml -e action=uninstall"
+          - "  Reinstall: ansible-playbook windows-client-controller.yaml -e action=reinstall"
+          - ""
+          - "Custom options:"
+          - "  -e vm_name=mywin11          Custom VM name"
+          - "  -e windows_admin_password='P@ss!'  Custom admin password"
+          - "  -e vhdx_path='/path/to/win11.vhdx'  Use existing VHDX"
+          - "  -e vm_cpu_cores=8 -e vm_memory=16Gi  More resources"

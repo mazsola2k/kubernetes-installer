@@ -1,0 +1,70 @@
+# Windows 11 Client Status Tasks
+
+- name: Display Windows 11 status information
+  ansible.builtin.debug:
+    msg:
+      - "📊 Windows 11 Client Status Check"
+      - "VM Name: {{ vm_name }}"
+      - "Namespace: {{ kubevirt_namespace }}"
+
+- name: Check VM resources
+  block:
+    - name: Check VirtualMachine
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: vm_info
+
+    - name: Check VirtualMachineInstance
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: vmi_info
+
+    - name: Check VM pod
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ kubevirt_namespace }}"
+        label_selectors:
+          - "kubevirt.io/vm={{ vm_name }}"
+      register: pod_info
+
+- name: Check services
+  ansible.builtin.shell: |
+    echo "=== Services for {{ vm_name }} ==="
+    kubectl get svc -n {{ kubevirt_namespace }} -l app={{ vm_name }} 2>&1 || echo "No services found"
+  register: service_check
+  changed_when: false
+
+- name: Check storage
+  ansible.builtin.shell: |
+    echo "=== PVCs for {{ vm_name }} ==="
+    kubectl get pvc -n {{ kubevirt_namespace }} | grep "{{ vm_name }}" || echo "No PVCs found"
+    echo "=== PVs for {{ vm_name }} ==="
+    kubectl get pv | grep "{{ vm_name }}" || echo "No PVs found"
+  register: storage_check
+  changed_when: false
+
+- name: Display status summary
+  ansible.builtin.debug:
+    msg:
+      - "=== Windows 11 Client Status Summary ==="
+      - "VM Exists:    {{ 'Yes (' + vm_info.resources[0].status.printableStatus + ')' if vm_info.resources | length > 0 else 'No' }}"
+      - "VMI Running:  {{ 'Yes - Phase: ' + vmi_info.resources[0].status.phase if vmi_info.resources | length > 0 else 'No' }}"
+      - "VMI Node:     {{ vmi_info.resources[0].status.nodeName | default('N/A') if vmi_info.resources | length > 0 else 'N/A' }}"
+      - "VMI IP:       {{ vmi_info.resources[0].status.interfaces[0].ipAddress | default('N/A') if vmi_info.resources | length > 0 else 'N/A' }}"
+      - "Pod Count:    {{ pod_info.resources | length }}"
+      - ""
+      - "{{ service_check.stdout_lines | join('\n') }}"
+      - ""
+      - "{{ storage_check.stdout_lines | join('\n') }}"
+      - ""
+      - "🖥️  Access commands:"
+      - "  VNC:     virtctl vnc {{ vm_name }} -n {{ kubevirt_namespace }}"
+      - "  Console: virtctl console {{ vm_name }} -n {{ kubevirt_namespace }}"
+      - "  RDP:     kubectl port-forward svc/{{ vm_name }}-rdp 3389:3389 -n {{ kubevirt_namespace }}"

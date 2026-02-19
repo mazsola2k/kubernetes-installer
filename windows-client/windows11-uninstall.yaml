@@ -1,0 +1,154 @@
+# Windows 11 Client Uninstall Tasks
+
+- name: Display uninstallation information
+  ansible.builtin.debug:
+    msg:
+      - "🗑️  Windows 11 Client Uninstallation"
+      - "VM Name: {{ vm_name }}"
+      - "Namespace: {{ kubevirt_namespace }}"
+      - "This will remove ALL Windows 11 resources and data"
+
+- name: Check existing resources
+  block:
+    - name: Check if VM exists
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: existing_vm
+
+    - name: Check if VMI exists
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: existing_vmi
+
+    - name: Display current status
+      ansible.builtin.debug:
+        msg:
+          - "📋 Current Status:"
+          - "  VM Exists: {{ 'Yes' if existing_vm.resources | length > 0 else 'No' }}"
+          - "  VMI Running: {{ 'Yes' if existing_vmi.resources | length > 0 else 'No' }}"
+          - "  VM Status: {{ existing_vm.resources[0].status.printableStatus | default('N/A') if existing_vm.resources | length > 0 else 'N/A' }}"
+
+- name: Stop and remove VM
+  block:
+    - name: Stop VM if running
+      ansible.builtin.shell: |
+        if kubectl get vmi {{ vm_name }} -n {{ kubevirt_namespace }} &>/dev/null; then
+          echo "Stopping VMI {{ vm_name }}..."
+          virtctl stop {{ vm_name }} -n {{ kubevirt_namespace }} || true
+        else
+          echo "No running VMI found"
+        fi
+      register: vm_stop_result
+      ignore_errors: true
+
+    - name: Wait for VMI to stop
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+      register: vmi_stop_status
+      until: vmi_stop_status.resources | length == 0
+      retries: 20
+      delay: 10
+      ignore_errors: true
+
+    - name: Delete VirtualMachine
+      kubernetes.core.k8s:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ vm_name }}"
+        namespace: "{{ kubevirt_namespace }}"
+        state: absent
+        wait: true
+        wait_timeout: 120
+      when: existing_vm.resources | length > 0
+      ignore_errors: true
+
+- name: Remove services
+  ansible.builtin.shell: |
+    for svc in vnc rdp winrm; do
+      kubectl delete svc {{ vm_name }}-${svc} -n {{ kubevirt_namespace }} --ignore-not-found=true || true
+    done
+    echo "Services removed"
+  ignore_errors: true
+
+- name: Remove sysprep secret
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Secret
+    name: "{{ vm_name }}-sysprep"
+    namespace: "{{ kubevirt_namespace }}"
+    state: absent
+  ignore_errors: true
+
+- name: Remove PersistentVolumeClaims
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: "{{ item }}"
+    namespace: "{{ kubevirt_namespace }}"
+    state: absent
+    wait: true
+    wait_timeout: 60
+  loop:
+    - "{{ vm_name }}-system-pvc"
+    - "{{ vm_name }}-installer-iso-pvc"
+    - "{{ vm_name }}-autounattend-pvc"
+    - "{{ vm_name }}-virtio-iso-pvc"
+  ignore_errors: true
+
+- name: Remove PersistentVolumes
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ item }}"
+    state: absent
+    wait: true
+    wait_timeout: 60
+  loop:
+    - "{{ vm_name }}-system-pv"
+    - "{{ vm_name }}-installer-iso-pv"
+    - "{{ vm_name }}-autounattend-pv"
+    - "{{ vm_name }}-virtio-iso-pv"
+  ignore_errors: true
+
+- name: Remove local storage directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-system-disk"
+    - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-installer-iso"
+    - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-autounattend"
+    - "{{ storage_dir | default('/var/lib/kubevirt') }}/{{ vm_name }}-virtio-iso"
+  ignore_errors: true
+
+- name: Verify uninstall completion
+  ansible.builtin.shell: |
+    echo "=== Verifying uninstall completion ==="
+    vm=$(kubectl get vm {{ vm_name }} -n {{ kubevirt_namespace }} 2>/dev/null | wc -l)
+    if [ "$vm" -eq 0 ]; then
+      echo "✓ VM removed"
+    else
+      echo "⚠ VM still exists"
+    fi
+    pvcs=$(kubectl get pvc -n {{ kubevirt_namespace }} | grep "{{ vm_name }}" | wc -l)
+    if [ "$pvcs" -eq 0 ]; then
+      echo "✓ PVCs removed"
+    else
+      echo "⚠ Found $pvcs remaining PVCs"
+    fi
+    echo "=== Uninstall verification completed ==="
+  register: uninstall_verify
+  ignore_errors: true
+
+- name: Display uninstall results
+  ansible.builtin.debug:
+    msg: "{{ uninstall_verify.stdout_lines | default([]) }}"
