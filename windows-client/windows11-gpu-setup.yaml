@@ -42,8 +42,18 @@
     gpu_audio_id: "{{ gpu_audio_id | default('10de:1aef') }}"
     gpu_resource_name: "{{ gpu_resource_name | default('nvidia.com/RTX_3090') }}"
 
-- name: Read current GRUB cmdline value
-  ansible.builtin.shell: grep '^GRUB_CMDLINE_LINUX=' /etc/default/grub | sed 's/GRUB_CMDLINE_LINUX=//;s/"//g'
+- name: Read current GRUB cmdline value (from active BLS loader entry)
+  ansible.builtin.shell: |
+    # On Fedora with BLS, /etc/default/grub is only a template — the BLS loader
+    # entry for the running kernel is the real boot source. Check that directly.
+    kernel_ver=$(uname -r)
+    entry=$(ls /boot/loader/entries/*-${kernel_ver}.conf 2>/dev/null | head -1)
+    if [ -n "$entry" ]; then
+      grep '^options ' "$entry" | sed 's/^options //'
+    else
+      # Fallback for non-BLS systems
+      grep '^GRUB_CMDLINE_LINUX=' /etc/default/grub | sed 's/GRUB_CMDLINE_LINUX=//;s/"//g'
+    fi
   register: current_grub_cmdline
   changed_when: false
 
@@ -154,14 +164,13 @@
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "CHANGES TO APPLY"
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      - "{% if change_grub %}  [1] MODIFY /etc/default/grub — ADD: {{ iommu_param }} iommu=pt{% else %}  [1] /etc/default/grub — no change needed{% endif %}"
+      - "{% if change_grub %}  [1] grubby --update-kernel=ALL --args='{{ iommu_param }} iommu=pt'  (BLS entries){% else %}  [1] GRUB BLS entries — no change needed{% endif %}"
       - "{% if change_vfio_modprobe %}  [2] CREATE /etc/modprobe.d/vfio-pci.conf: softdep nvidia pre: vfio-pci (NO ids= to protect 2nd GPU){% else %}  [2] /etc/modprobe.d/vfio-pci.conf — no change needed{% endif %}"
       - "{% if change_vfio_dracut_hook %}  [3] CREATE /usr/lib/dracut/hooks/pre-udev/80-vfio-pci-override.sh (slot-specific: {{ gpu_pci_slot }} only){% else %}  [3] dracut pre-udev hook — no change needed{% endif %}"
       - "{% if change_vfio_dracut_conf %}  [4] CREATE /etc/dracut.conf.d/vfio-pci.conf (include vfio modules + hook){% else %}  [4] /etc/dracut.conf.d/vfio-pci.conf — no change needed{% endif %}"
       - "{% if change_vfio_modules %}  [5] CREATE /etc/modules-load.d/vfio-pci.conf: vfio vfio_iommu_type1 vfio-pci{% else %}  [5] /etc/modules-load.d/vfio-pci.conf — no change needed{% endif %}"
       - "{% if reboot_required %}  [6] dracut --force  (rebuild initramfs){% else %}  [6] dracut — no rebuild needed{% endif %}"
-      - "{% if change_grub %}  [7] grub2-mkconfig  (regenerate GRUB config){% else %}  [7] grub2-mkconfig — no rebuild needed{% endif %}"
-      - "{% if change_kubevirt %}  [8] kubectl patch kubevirt — add PermittedHostDevices ({{ gpu_vendor_id }}){% else %}  [8] KubeVirt PermittedHostDevices — no change needed{% endif %}"
+      - "{% if change_kubevirt %}  [7] kubectl patch kubevirt — add PermittedHostDevices ({{ gpu_vendor_id }}){% else %}  [7] KubeVirt PermittedHostDevices — no change needed{% endif %}"
       - ""
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "  DUAL-GPU SAFE: Only {{ gpu_pci_slot }} targeted. GPU at 0a:00.0 stays on nvidia for Fedora desktop."
@@ -210,12 +219,11 @@
 - name: Apply host IOMMU / vfio configuration
   when: (change_grub or change_vfio_modprobe or change_vfio_modules or change_vfio_dracut_hook or change_vfio_dracut_conf) and (gpu_action | default('setup') == 'setup')
   block:
-    - name: Add IOMMU parameters to GRUB cmdline
-      ansible.builtin.lineinfile:
-        path: /etc/default/grub
-        regexp: '^GRUB_CMDLINE_LINUX='
-        line: 'GRUB_CMDLINE_LINUX="{{ current_grub_cmdline.stdout }} {{ iommu_param }} iommu=pt"'
-        backup: yes
+    - name: Add IOMMU parameters to all kernel entries (grubby — BLS-aware)
+      # grubby directly updates /boot/loader/entries/*.conf — the real boot source.
+      # No grub2-mkconfig needed. Works correctly on Fedora with Secure Boot too.
+      ansible.builtin.shell: "grubby --update-kernel=ALL --args='{{ iommu_param }} iommu=pt'"
+      changed_when: true
       when: change_grub
 
     - name: Write vfio-pci modprobe configuration (softdeps only — no ids=)
@@ -274,25 +282,7 @@
       changed_when: true
       when: change_grub or change_vfio_modprobe or change_vfio_dracut_hook or change_vfio_dracut_conf or change_vfio_modules
 
-    - name: Detect GRUB config output path
-      ansible.builtin.shell: |
-        # Fedora uses a wrapper at /boot/efi/EFI/fedora/grub.cfg that redirects
-        # writes to /boot/grub2/grub.cfg — always use the grub2 path on Fedora.
-        # Fall back to /boot/grub/grub.cfg for non-Fedora distros.
-        if [ -f /boot/grub2/grub.cfg ]; then
-          echo "/boot/grub2/grub.cfg"
-        elif [ -f /boot/grub/grub.cfg ]; then
-          echo "/boot/grub/grub.cfg"
-        else
-          echo "/boot/grub2/grub.cfg"
-        fi
-      register: grub_cfg_path
-      changed_when: false
-
-    - name: Regenerate GRUB configuration
-      ansible.builtin.shell: "grub2-mkconfig -o {{ grub_cfg_path.stdout | trim }}"
-      changed_when: true
-      when: change_grub
+    # grubby (used above) updates BLS entries directly — no grub2-mkconfig needed.
 
 # ============================================================
 # Phase 5 — Configure KubeVirt PermittedHostDevices  (gpu-setup only)
