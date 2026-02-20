@@ -309,6 +309,20 @@
                     <Order>3</Order>
                     <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
                   </RunSynchronousCommand>
+                  <!--
+                    Orders 4-5: Load VirtIO storage drivers into WinPE memory BEFORE DiskConfiguration.
+                    drvload is immediate and deterministic - the disk becomes visible as soon as it returns.
+                    Scans all drive letters to find whichever letter Windows PE assigns to the VirtIO ISO.
+                    In WinPE cmd.exe (not a batch file) for-loop variables use single %.
+                  -->
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>4</Order>
+                    <Path>cmd /c for %i in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %i:\viostor\w11\amd64\viostor.inf drvload %i:\viostor\w11\amd64\viostor.inf</Path>
+                  </RunSynchronousCommand>
+                  <RunSynchronousCommand wcm:action="add">
+                    <Order>5</Order>
+                    <Path>cmd /c for %i in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist %i:\vioscsi\w11\amd64\vioscsi.inf drvload %i:\vioscsi\w11\amd64\vioscsi.inf</Path>
+                  </RunSynchronousCommand>
                 </RunSynchronous>
                 <!-- DiskConfiguration: WillWipeDisk omitted (defaults false).
                      The target disk is always a fresh blank RAW image so there is nothing
@@ -382,8 +396,40 @@
                     <WillShowUI>Never</WillShowUI>
                   </ProductKey>
                 </UserData>
-                <!-- No DriverPaths needed: disk0 uses SATA bus which Windows PE supports natively.
-                     VirtIO drivers (NetKVM, Balloon, etc.) are installed post-boot via FirstLogonCommands. -->
+                <!-- disk0 uses virtio bus for native performance.
+                     viostor/vioscsi are loaded via drvload in RunSynchronous Orders 4-5 above,
+                     making the disk visible to Windows PE before DiskConfiguration runs.
+                     Remaining VirtIO drivers (NetKVM, Balloon, etc.) are installed post-boot via FirstLogonCommands. -->
+              </component>
+            </settings>
+            <!--
+              offlineServicing pass: runs AFTER APPLY (files copied to C:\) but BEFORE POST_INSTALL
+              (BCD written). The CDROMs are still mounted at the same letters as in WinPE.
+              Drive letter assignment for our 3 SATA CDROMs:
+                D: = installer-iso (sata port 0)
+                E: = autounattend  (sata port 1)
+                F: = virtio-iso    (sata port 2)
+              PnpCustomizationsNonWinPE injects viostor + vioscsi into the OFFLINE Windows image
+              driver store so the OS has the driver ready on first boot - preventing INACCESSIBLE_BOOT_DEVICE.
+              Only F: is listed - confirmed drive letter from disk attachment order.
+              Listing non-existent paths here causes ERROR_PATH_NOT_FOUND (0x80070003) in POST_INSTALL.
+            -->
+            <settings pass="offlineServicing">
+              <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         name="Microsoft-Windows-PnpCustomizationsNonWinPE"
+                         processorArchitecture="amd64"
+                         publicKeyToken="31bf3856ad364e35"
+                         language="neutral"
+                         versionScope="nonSxS">
+                <DriverPaths>
+                  <PathAndCredentials wcm:action="add" wcm:keyValue="1">
+                    <Path>F:\viostor\w11\amd64</Path>
+                  </PathAndCredentials>
+                  <PathAndCredentials wcm:action="add" wcm:keyValue="2">
+                    <Path>F:\vioscsi\w11\amd64</Path>
+                  </PathAndCredentials>
+                </DriverPaths>
               </component>
             </settings>
             <settings pass="specialize">
@@ -810,7 +856,7 @@
                         bootOrder: 1
                       - name: disk0
                         disk:
-                          bus: sata
+                          bus: virtio
                         bootOrder: 2
                       - name: autounattend
                         cdrom:
