@@ -35,7 +35,11 @@
 
 - name: Set per-host variables
   ansible.builtin.set_fact:
-    iommu_param: "{{ 'intel_iommu=on' if 'Intel' in cpu_vendor.stdout else 'amd_iommu=on' }}"
+    # AMD: IOMMU auto-enables when BIOS presents IVRS ACPI table — no amd_iommu= needed.
+    #      (amd_iommu=on is NOT a valid value; force_enable is only for buggy BIOS with IVRS)
+    # Intel: intel_iommu=on is required to activate VT-d.
+    # Both: iommu=pt (passthrough mode) is always added separately.
+    iommu_param: "{{ 'intel_iommu=on' if 'Intel' in cpu_vendor.stdout else '' }}"
     gpu_pci_slot: "{{ gpu_pci_slot | default('0000:03:00.0') }}"
     gpu_audio_slot: "{{ gpu_audio_slot | default('0000:03:00.1') }}"
     gpu_vendor_id: "{{ gpu_vendor_id | default('10de:2204') }}"
@@ -57,9 +61,38 @@
   register: current_grub_cmdline
   changed_when: false
 
+- name: Check BIOS IOMMU enablement (IVRS table for AMD, DMAR table for Intel)
+  ansible.builtin.shell: |
+    if [ -f /sys/firmware/acpi/tables/IVRS ]; then
+      echo "IVRS"
+    elif [ -f /sys/firmware/acpi/tables/DMAR ]; then
+      echo "DMAR"
+    else
+      echo "absent"
+    fi
+  register: bios_iommu_table
+  changed_when: false
+
+- name: Set BIOS IOMMU status
+  ansible.builtin.set_fact:
+    bios_iommu_enabled: "{{ bios_iommu_table.stdout != 'absent' }}"
+
 - name: Check IOMMU already present in GRUB
   ansible.builtin.set_fact:
-    iommu_in_grub: "{{ iommu_param in current_grub_cmdline.stdout }}"
+    # iommu=pt must always be present.
+    # For Intel, intel_iommu=on must also be present.
+    # For AMD, no amd_iommu= is needed — only iommu=pt.
+    iommu_in_grub: >-
+      {{
+        'iommu=pt' in current_grub_cmdline.stdout and
+        (iommu_param == '' or iommu_param in current_grub_cmdline.stdout)
+      }}
+    # Detect stale amd_iommu= params left from prior runs (need removal)
+    stale_amd_iommu_in_grub: >-
+      {{
+        'Intel' not in cpu_vendor.stdout and
+        'amd_iommu=' in current_grub_cmdline.stdout
+      }}
 
 - name: Check vfio-pci modprobe config
   ansible.builtin.stat:
@@ -103,14 +136,14 @@
 - name: Get current GPU VGA driver
   ansible.builtin.shell: |
     drv=$(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null)
-    basename "$drv" 2>/dev/null || echo "none"
+    if [ -n "$drv" ]; then basename "$drv"; else echo "none"; fi
   register: gpu_current_driver
   changed_when: false
 
 - name: Get current GPU Audio driver
   ansible.builtin.shell: |
     drv=$(readlink /sys/bus/pci/devices/{{ gpu_audio_slot }}/driver 2>/dev/null)
-    basename "$drv" 2>/dev/null || echo "none"
+    if [ -n "$drv" ]; then basename "$drv"; else echo "none"; fi
   register: gpu_audio_current_driver
   changed_when: false
 
@@ -123,7 +156,7 @@
 
 - name: Compute what needs to change
   ansible.builtin.set_fact:
-    change_grub: "{{ not iommu_in_grub }}"
+    change_grub: "{{ not iommu_in_grub or stale_amd_iommu_in_grub }}"
     change_vfio_modprobe: "{{ not vfio_modprobe_ok }}"
     change_vfio_modules: "{{ not vfio_modules_stat.stat.exists }}"
     change_vfio_dracut_hook: "{{ not vfio_dracut_hook_stat.stat.exists }}"
@@ -146,7 +179,8 @@
       - ""
       - "  Host GPU : NVIDIA GeForce RTX 3090 ({{ gpu_pci_slot }})"
       - "  PCI IDs  : VGA={{ gpu_vendor_id }}   Audio={{ gpu_audio_id }}"
-      - "  CPU      : {{ cpu_vendor.stdout }} → IOMMU param: {{ iommu_param }}"
+      - "  CPU      : {{ cpu_vendor.stdout }} → kernel params: {{ (iommu_param ~ ' ') if iommu_param else '' }}iommu=pt"
+      - "  BIOS IOMMU : {{ bios_iommu_table.stdout if bios_iommu_enabled else 'NOT DETECTED — enable AMD-Vi / VT-d in BIOS!' }}"
       - ""
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "CURRENT STATE"
@@ -164,7 +198,7 @@
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "CHANGES TO APPLY"
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-      - "{% if change_grub %}  [1] grubby --update-kernel=ALL --args='{{ iommu_param }} iommu=pt'  (BLS entries){% else %}  [1] GRUB BLS entries — no change needed{% endif %}"
+      - "{% if change_grub %}  [1] grubby --update-kernel=ALL --args='{{ (iommu_param ~ ' ') if iommu_param else '' }}iommu=pt'{% if stale_amd_iommu_in_grub %}  + remove stale amd_iommu= params{% endif %}{% else %}  [1] GRUB BLS entries — no change needed{% endif %}"
       - "{% if change_vfio_modprobe %}  [2] CREATE /etc/modprobe.d/vfio-pci.conf: softdep nvidia pre: vfio-pci (NO ids= to protect 2nd GPU){% else %}  [2] /etc/modprobe.d/vfio-pci.conf — no change needed{% endif %}"
       - "{% if change_vfio_dracut_hook %}  [3] CREATE /usr/lib/dracut/hooks/pre-udev/80-vfio-pci-override.sh (slot-specific: {{ gpu_pci_slot }} only){% else %}  [3] dracut pre-udev hook — no change needed{% endif %}"
       - "{% if change_vfio_dracut_conf %}  [4] CREATE /etc/dracut.conf.d/vfio-pci.conf (include vfio modules + hook){% else %}  [4] /etc/dracut.conf.d/vfio-pci.conf — no change needed{% endif %}"
@@ -174,12 +208,18 @@
       - ""
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "  DUAL-GPU SAFE: Only {{ gpu_pci_slot }} targeted. GPU at 0a:00.0 stays on nvidia for Fedora desktop."
-      - "{% if reboot_required %}  *** HOST REBOOT REQUIRED after apply ***{% else %}  No reboot required — IOMMU and vfio-pci already active{% endif %}"
+      - "{% if not bios_iommu_enabled %}  ⚠ BIOS IOMMU NOT ENABLED — GPU passthrough WILL NOT WORK until you enable AMD-Vi (or VT-d) in BIOS firmware setup!{% endif %}"
+      - "{% if not bios_iommu_enabled %}    → Reboot into BIOS (Del/F2), enable AMD-Vi/IOMMU (Gigabyte: Settings → AMD CBS → NBIO → IOMMU → Enabled){% endif %}"
+      - "{% if reboot_required %}  *** HOST REBOOT REQUIRED after apply ***{% elif not bios_iommu_enabled %}  *** BIOS CHANGE + REBOOT REQUIRED ***{% else %}  No reboot required — IOMMU and vfio-pci already active{% endif %}"
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 - name: Nothing to do — already fully configured
   ansible.builtin.debug:
-    msg: "GPU passthrough is already fully configured — nothing to apply."
+    msg: >-
+      GPU passthrough host config is complete — nothing to apply.
+      {{ '' if bios_iommu_enabled else
+         '⚠ BUT: BIOS IOMMU is NOT enabled! Enable AMD-Vi/IOMMU in BIOS firmware, then reboot. '
+         'After reboot verify: sudo dmesg | grep AMD-Vi && ls /sys/kernel/iommu_groups/ | wc -l' }}
   when:
     - gpu_action | default('setup') == 'setup'
     - not change_grub
@@ -219,10 +259,21 @@
 - name: Apply host IOMMU / vfio configuration
   when: (change_grub or change_vfio_modprobe or change_vfio_modules or change_vfio_dracut_hook or change_vfio_dracut_conf) and (gpu_action | default('setup') == 'setup')
   block:
+    - name: Remove stale amd_iommu parameters from BLS entries (AMD only)
+      # amd_iommu=on was never valid; force_enable only for buggy BIOS with IVRS.
+      # AMD IOMMU auto-enables from BIOS IVRS — no amd_iommu= param needed at all.
+      ansible.builtin.shell: >-
+        grubby --update-kernel=ALL
+        --remove-args='amd_iommu=on amd_iommu=force_enable amd_iommu=fullflush amd_iommu=force_isolation'
+      changed_when: true
+      when: stale_amd_iommu_in_grub | bool
+
     - name: Add IOMMU parameters to all kernel entries (grubby — BLS-aware)
       # grubby directly updates /boot/loader/entries/*.conf — the real boot source.
       # No grub2-mkconfig needed. Works correctly on Fedora with Secure Boot too.
-      ansible.builtin.shell: "grubby --update-kernel=ALL --args='{{ iommu_param }} iommu=pt'"
+      # AMD: only iommu=pt (IOMMU auto-enables from BIOS IVRS table)
+      # Intel: intel_iommu=on iommu=pt
+      ansible.builtin.shell: "grubby --update-kernel=ALL --args='{{ (iommu_param ~ ' ') if iommu_param else '' }}iommu=pt'"
       changed_when: true
       when: change_grub
 
@@ -363,6 +414,11 @@
       - "  !! REBOOT NOW to activate IOMMU + vfio-pci binding:"
       - "       sudo reboot"
       - ""
+      - "{% if not bios_iommu_enabled %}  ⚠ CRITICAL: BIOS IOMMU is NOT enabled! Before rebooting:{% endif %}"
+      - "{% if not bios_iommu_enabled %}    1. Enter BIOS firmware setup (Del/F2 at POST){% endif %}"
+      - "{% if not bios_iommu_enabled %}    2. Enable AMD-Vi / IOMMU (Gigabyte: Settings → AMD CBS → NBIO → IOMMU → Enabled){% endif %}"
+      - "{% if not bios_iommu_enabled %}    3. Save & Exit, then verify: sudo dmesg | grep -i 'AMD-Vi\\|IVRS'{% endif %}"
+      - "{% if not bios_iommu_enabled %}{% endif %}"
       - "  After reboot, verify with:"
       - "       sudo dmesg | grep -i iommu"
       - "       lspci -k -s {{ gpu_pci_slot }}"
@@ -371,10 +427,30 @@
       - "  Then deploy Windows 11 with GPU:"
       - "    ansible-playbook windows-client-controller.yaml -e action=reinstall -e enable_gpu=true"
 
-- name: Display result summary (no reboot needed)
+- name: Display result summary (no reboot — but BIOS IOMMU missing)
   when:
     - gpu_action | default('setup') == 'setup'
     - not (reboot_required | bool)
+    - not bios_iommu_enabled
+  ansible.builtin.debug:
+    msg:
+      - "  Host config is complete, but BIOS IOMMU is NOT enabled."
+      - ""
+      - "  ⚠ REQUIRED: Enable AMD-Vi / IOMMU in BIOS firmware:"
+      - "    1. Reboot → enter BIOS (Del or F2 at POST)"
+      - "    2. Gigabyte: Settings → AMD CBS → NBIO Common Options → IOMMU → Enabled"
+      - "    3. Save & Exit → boot into Fedora"
+      - ""
+      - "  After BIOS change + reboot, verify:"
+      - "    sudo dmesg | grep -i 'AMD-Vi\\|IVRS'"
+      - "    ls /sys/kernel/iommu_groups/ | wc -l   (should be > 0)"
+      - "    lspci -k -s {{ gpu_pci_slot }}          (should show: vfio-pci)"
+
+- name: Display result summary (no reboot needed — all good)
+  when:
+    - gpu_action | default('setup') == 'setup'
+    - not (reboot_required | bool)
+    - bios_iommu_enabled
   ansible.builtin.debug:
     msg:
       - "  No reboot required — IOMMU and vfio-pci already active"
