@@ -7,6 +7,10 @@
 #   ansible-playbook windows-client-controller.yaml -e action=status
 #   ansible-playbook windows-client-controller.yaml -e action=uninstall
 #   ansible-playbook windows-client-controller.yaml -e action=reinstall
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-setup
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-setup -e gpu_confirm=yes
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-claim
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-release
 #
 # Key variables (override with -e):
 #   vm_name              VM name in Kubernetes (default: win11client)
@@ -20,6 +24,12 @@
 #   installer_iso_size   PV size for Windows ISO (default: 8Gi)
 #   virtio_iso_path      Optional: custom path to virtio-win.iso
 #   iso_download_url     URL to download ISO if not present
+#   enable_gpu           Pass GPU to the VM (requires gpu-setup + reboot first)
+#   gpu_pci_slot         PCI address of GPU to pass through (default: 0000:03:00.0)
+#   gpu_vendor_id        GPU vendor:device PCI IDs (default: 10de:2204)
+#   gpu_audio_id         GPU audio vendor:device PCI IDs (default: 10de:1aef)
+#   gpu_confirm          Skip interactive confirmation in gpu-setup (default: no)
+#   gpu_action           Internal: set by controller per action (setup/claim/release)
 #   windows 11 urls      https://www.windowscentral.com/microsoft/windows-11/microsofts-official-windows-11-version-25h2-rtm-iso-media-is-now-available-download-all-28-languages-here-for-x64-or-arm64
 
 - name: Windows Client Controller
@@ -47,7 +57,7 @@
     - name: Validate action parameter
       ansible.builtin.fail:
         msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, status"
-      when: action not in ['install', 'uninstall', 'reinstall', 'status']
+      when: action not in ['install', 'uninstall', 'reinstall', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release']
 
     - name: Display controller banner
       ansible.builtin.debug:
@@ -75,6 +85,27 @@
       ansible.builtin.include_tasks: windows-client/windows11-status.yaml
       when: action == 'status'
 
+    # GPU passthrough setup (detect → dry-run → confirm → apply)
+    - name: Execute GPU passthrough host setup
+      ansible.builtin.include_tasks: windows-client/windows11-gpu-setup.yaml
+      vars:
+        gpu_action: setup
+      when: action == 'gpu-setup'
+
+    # GPU claim — unbind nvidia, bind vfio-pci, start Windows VM (no reboot)
+    - name: Execute GPU claim for Windows VM
+      ansible.builtin.include_tasks: windows-client/windows11-gpu-setup.yaml
+      vars:
+        gpu_action: claim
+      when: action == 'gpu-claim'
+
+    # GPU release — stop Windows VM, unbind vfio-pci, bind nvidia (no reboot)
+    - name: Execute GPU release back to Fedora
+      ansible.builtin.include_tasks: windows-client/windows11-gpu-setup.yaml
+      vars:
+        gpu_action: release
+      when: action == 'gpu-release'
+
     # Reinstall (uninstall then install)
     - name: Execute Windows 11 reinstallation
       block:
@@ -97,9 +128,17 @@
           - "  Status:    ansible-playbook windows-client-controller.yaml -e action=status"
           - "  Uninstall: ansible-playbook windows-client-controller.yaml -e action=uninstall"
           - "  Reinstall: ansible-playbook windows-client-controller.yaml -e action=reinstall"
+          - "  GPU Setup: ansible-playbook windows-client-controller.yaml -e action=gpu-setup"
+          - "  GPU Claim: ansible-playbook windows-client-controller.yaml -e action=gpu-claim"
+          - "  GPU Rel:   ansible-playbook windows-client-controller.yaml -e action=gpu-release"
           - ""
           - "Custom options:"
           - "  -e vm_name=mywin11          Custom VM name"
           - "  -e windows_admin_password='P@ss!'  Custom admin password"
           - "  -e vhdx_path='/path/to/win11.vhdx'  Use existing VHDX"
           - "  -e vm_cpu_cores=8 -e vm_memory=16Gi  More resources"
+          - ""
+          - "GPU passthrough:"
+          - "  Step 1 (one-time):  -e action=gpu-setup   then: sudo reboot"
+          - "  Use Windows + GPU:  -e action=gpu-claim    (nvidia → vfio-pci, starts VM)"
+          - "  Use Fedora AI/CUDA: -e action=gpu-release  (stops VM, vfio-pci → nvidia)"

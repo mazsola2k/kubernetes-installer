@@ -1,0 +1,547 @@
+---
+# Windows 11 GPU Passthrough Setup
+# Detects current host state, shows all required changes as a dry-run, asks for
+# confirmation, then applies: IOMMU in GRUB, vfio-pci modprobe/modules-load,
+# initramfs + GRUB rebuild, and KubeVirt PermittedHostDevices registration.
+#
+# A HOST REBOOT is required after apply before the GPU is available to the VM.
+#
+# Usage — initial host setup (one-time, reboot required after):
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-setup
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-setup -e gpu_confirm=yes
+#
+# Usage — claim GPU for Windows VM (nvidia → vfio-pci, no reboot):
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-claim
+#
+# Usage — release GPU back to Fedora desktop/AI (vfio-pci → nvidia, no reboot):
+#   ansible-playbook windows-client-controller.yaml -e action=gpu-release
+#
+# Variables (all have defaults):
+#   gpu_pci_slot         PCI address of GPU VGA function   (default: 0000:03:00.0)
+#   gpu_audio_slot       PCI address of GPU audio function  (default: 0000:03:00.1)
+#   gpu_vendor_id        PCI vendor:device for VGA          (default: 10de:2204)
+#   gpu_audio_id         PCI vendor:device for audio        (default: 10de:1aef)
+#   gpu_resource_name    KubeVirt resource name             (default: nvidia.com/RTX_3090)
+#   gpu_confirm          Skip interactive prompt in gpu-setup (default: no)
+#   vm_name              VM to stop/start during claim/release (default: win11client)
+
+# ============================================================
+# Phase 1 — Gather current host state
+# ============================================================
+- name: Detect CPU vendor
+  ansible.builtin.shell: grep -m1 vendor_id /proc/cpuinfo | awk '{print $3}'
+  register: cpu_vendor
+  changed_when: false
+
+- name: Set per-host variables
+  ansible.builtin.set_fact:
+    iommu_param: "{{ 'intel_iommu=on' if 'Intel' in cpu_vendor.stdout else 'amd_iommu=on' }}"
+    gpu_pci_slot: "{{ gpu_pci_slot | default('0000:03:00.0') }}"
+    gpu_audio_slot: "{{ gpu_audio_slot | default('0000:03:00.1') }}"
+    gpu_vendor_id: "{{ gpu_vendor_id | default('10de:2204') }}"
+    gpu_audio_id: "{{ gpu_audio_id | default('10de:1aef') }}"
+    gpu_resource_name: "{{ gpu_resource_name | default('nvidia.com/RTX_3090') }}"
+
+- name: Read current GRUB cmdline value
+  ansible.builtin.shell: grep '^GRUB_CMDLINE_LINUX=' /etc/default/grub | sed 's/GRUB_CMDLINE_LINUX=//;s/"//g'
+  register: current_grub_cmdline
+  changed_when: false
+
+- name: Check IOMMU already present in GRUB
+  ansible.builtin.set_fact:
+    iommu_in_grub: "{{ iommu_param in current_grub_cmdline.stdout }}"
+
+- name: Check vfio-pci modprobe config
+  ansible.builtin.stat:
+    path: /etc/modprobe.d/vfio-pci.conf
+  register: vfio_modprobe_stat
+
+- name: Read existing vfio-pci modprobe config
+  ansible.builtin.slurp:
+    src: /etc/modprobe.d/vfio-pci.conf
+  register: vfio_modprobe_content
+  when: vfio_modprobe_stat.stat.exists
+
+- name: Detect whether vfio IDs already set
+  ansible.builtin.set_fact:
+    vfio_ids_set: >-
+      {{
+        vfio_modprobe_stat.stat.exists and
+        gpu_vendor_id in (vfio_modprobe_content.content | default('') | b64decode) and
+        gpu_audio_id in (vfio_modprobe_content.content | default('') | b64decode)
+      }}
+
+- name: Check vfio modules-load config
+  ansible.builtin.stat:
+    path: /etc/modules-load.d/vfio-pci.conf
+  register: vfio_modules_stat
+
+- name: Get current GPU VGA driver
+  ansible.builtin.shell: |
+    drv=$(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null)
+    basename "$drv" 2>/dev/null || echo "none"
+  register: gpu_current_driver
+  changed_when: false
+
+- name: Get current GPU Audio driver
+  ansible.builtin.shell: |
+    drv=$(readlink /sys/bus/pci/devices/{{ gpu_audio_slot }}/driver 2>/dev/null)
+    basename "$drv" 2>/dev/null || echo "none"
+  register: gpu_audio_current_driver
+  changed_when: false
+
+- name: Check KubeVirt PermittedHostDevices
+  ansible.builtin.shell: |
+    kubectl get kubevirt kubevirt -n kubevirt \
+      -o jsonpath='{.spec.configuration.permittedHostDevices}' 2>/dev/null || echo ""
+  register: kubevirt_permitted_devices
+  changed_when: false
+
+- name: Compute what needs to change
+  ansible.builtin.set_fact:
+    change_grub: "{{ not iommu_in_grub }}"
+    change_vfio_modprobe: "{{ not vfio_ids_set }}"
+    change_vfio_modules: "{{ not vfio_modules_stat.stat.exists }}"
+    change_kubevirt: "{{ gpu_vendor_id not in kubevirt_permitted_devices.stdout }}"
+    reboot_required: "{{ not iommu_in_grub or not vfio_ids_set or not vfio_modules_stat.stat.exists }}"
+
+# ============================================================
+# Phase 2 — Dry-run summary  (gpu-setup only)
+# ============================================================
+- name: Show current state and planned changes
+  when: gpu_action | default('setup') == 'setup'
+  ansible.builtin.debug:
+    msg:
+      - "╔══════════════════════════════════════════════════════════════╗"
+      - "║          GPU PASSTHROUGH SETUP — PLANNED CHANGES             ║"
+      - "╚══════════════════════════════════════════════════════════════╝"
+      - ""
+      - "  Host GPU : NVIDIA GeForce RTX 3090 ({{ gpu_pci_slot }})"
+      - "  PCI IDs  : VGA={{ gpu_vendor_id }}   Audio={{ gpu_audio_id }}"
+      - "  CPU      : {{ cpu_vendor.stdout }} → IOMMU param: {{ iommu_param }}"
+      - ""
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "CURRENT STATE"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  GRUB cmdline    : {{ current_grub_cmdline.stdout }}"
+      - "  IOMMU in GRUB   : {{ 'YES' if iommu_in_grub else 'NO' }}"
+      - "  vfio modprobe   : {{ 'exists' if vfio_modprobe_stat.stat.exists else 'MISSING' }}"
+      - "  vfio IDs set    : {{ 'YES' if vfio_ids_set else 'NO' }}"
+      - "  vfio modules-ld : {{ 'exists' if vfio_modules_stat.stat.exists else 'MISSING' }}"
+      - "  GPU VGA driver  : {{ gpu_current_driver.stdout }}"
+      - "  GPU Audio driver: {{ gpu_audio_current_driver.stdout }}"
+      - "  KubeVirt GPU    : {{ 'configured' if not change_kubevirt else 'NOT configured' }}"
+      - ""
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "CHANGES TO APPLY"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "{% if change_grub %}  [1] MODIFY /etc/default/grub — ADD: {{ iommu_param }} iommu=pt{% else %}  [1] /etc/default/grub — no change needed{% endif %}"
+      - "{% if change_vfio_modprobe %}  [2] CREATE /etc/modprobe.d/vfio-pci.conf:{% else %}  [2] /etc/modprobe.d/vfio-pci.conf — no change needed{% endif %}"
+      - "{% if change_vfio_modprobe %}       options vfio-pci ids={{ gpu_vendor_id }},{{ gpu_audio_id }}{% endif %}"
+      - "{% if change_vfio_modprobe %}       softdep nvidia pre: vfio-pci{% endif %}"
+      - "{% if change_vfio_modules %}  [3] CREATE /etc/modules-load.d/vfio-pci.conf: vfio vfio_iommu_type1 vfio-pci{% else %}  [3] /etc/modules-load.d/vfio-pci.conf — no change needed{% endif %}"
+      - "{% if reboot_required %}  [4] dracut --force  (rebuild initramfs){% else %}  [4] dracut — no rebuild needed{% endif %}"
+      - "{% if change_grub %}  [5] grub2-mkconfig  (regenerate GRUB config){% else %}  [5] grub2-mkconfig — no rebuild needed{% endif %}"
+      - "{% if change_kubevirt %}  [6] kubectl patch kubevirt — add PermittedHostDevices ({{ gpu_vendor_id }}){% else %}  [6] KubeVirt PermittedHostDevices — no change needed{% endif %}"
+      - ""
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "{% if reboot_required %}  *** HOST REBOOT REQUIRED after apply ***{% else %}  No reboot required — IOMMU and vfio-pci already active{% endif %}"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+- name: Nothing to do — already fully configured
+  ansible.builtin.debug:
+    msg: "GPU passthrough is already fully configured — nothing to apply."
+  when:
+    - gpu_action | default('setup') == 'setup'
+    - not change_grub
+    - not change_vfio_modprobe
+    - not change_vfio_modules
+    - not change_kubevirt
+
+# ============================================================
+# Phase 3 — Confirmation prompt
+# ============================================================
+- name: Ask user to confirm
+  ansible.builtin.pause:
+    prompt: |
+
+      Review the planned changes above.
+      Type  YES  to proceed and apply all changes, or press Ctrl+C to abort
+  register: confirmation_result
+  when:
+    - gpu_action | default('setup') == 'setup'
+    - gpu_confirm | default('no') | lower != 'yes'
+    - change_grub or change_vfio_modprobe or change_vfio_modules or change_kubevirt
+
+- name: Abort if user did not confirm
+  ansible.builtin.fail:
+    msg: "Aborted — user did not type YES. No changes were made."
+  when:
+    - gpu_action | default('setup') == 'setup'
+    - gpu_confirm | default('no') | lower != 'yes'
+    - change_grub or change_vfio_modprobe or change_vfio_modules or change_kubevirt
+    - confirmation_result.user_input | default('') | upper != 'YES'
+
+# ============================================================
+# Phase 4 — Apply host-level changes  (gpu-setup only)
+# ============================================================
+- name: Apply host IOMMU / vfio configuration
+  when: (change_grub or change_vfio_modprobe or change_vfio_modules) and (gpu_action | default('setup') == 'setup')
+  block:
+    - name: Add IOMMU parameters to GRUB cmdline
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: 'GRUB_CMDLINE_LINUX="{{ current_grub_cmdline.stdout }} {{ iommu_param }} iommu=pt"'
+        backup: yes
+      when: change_grub
+
+    - name: Write vfio-pci modprobe configuration
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/vfio-pci.conf
+        mode: '0644'
+        content: |
+          # vfio-pci GPU passthrough — NVIDIA GeForce RTX 3090
+          # VGA  {{ gpu_vendor_id }}   Audio  {{ gpu_audio_id }}
+          options vfio-pci ids={{ gpu_vendor_id }},{{ gpu_audio_id }}
+
+          # Ensure vfio-pci claims the GPU before nvidia loads
+          softdep nvidia pre: vfio-pci
+          softdep nvidia_drm pre: vfio-pci
+          softdep nvidia_modeset pre: vfio-pci
+          softdep nvidia_uvm pre: vfio-pci
+      when: change_vfio_modprobe
+
+    - name: Write vfio modules-load configuration
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/vfio-pci.conf
+        mode: '0644'
+        content: |
+          vfio
+          vfio_iommu_type1
+          vfio-pci
+      when: change_vfio_modules
+
+    - name: Rebuild initramfs (dracut --force)
+      ansible.builtin.shell: dracut --force
+      changed_when: true
+
+    - name: Detect GRUB config output path (UEFI vs BIOS)
+      ansible.builtin.shell: |
+        if [ -d /boot/efi/EFI/fedora ]; then
+          echo "/boot/efi/EFI/fedora/grub.cfg"
+        else
+          echo "/boot/grub2/grub.cfg"
+        fi
+      register: grub_cfg_path
+      changed_when: false
+
+    - name: Regenerate GRUB configuration
+      ansible.builtin.shell: "grub2-mkconfig -o {{ grub_cfg_path.stdout | trim }}"
+      changed_when: true
+      when: change_grub
+
+# ============================================================
+# Phase 5 — Configure KubeVirt PermittedHostDevices  (gpu-setup only)
+# ============================================================
+- name: Patch KubeVirt to allow GPU passthrough
+  when: change_kubevirt and (gpu_action | default('setup') == 'setup')
+  block:
+    - name: Check if pciHostDevices list already exists in KubeVirt
+      ansible.builtin.shell: |
+        kubectl get kubevirt kubevirt -n kubevirt \
+          -o jsonpath='{.spec.configuration.permittedHostDevices.pciHostDevices}' 2>/dev/null || echo ""
+      register: existing_pci_devices
+      changed_when: false
+
+    - name: Patch KubeVirt — fresh permittedHostDevices (none existed)
+      ansible.builtin.shell: |
+        kubectl patch kubevirt kubevirt -n kubevirt --type=merge -p '{
+          "spec": {
+            "configuration": {
+              "permittedHostDevices": {
+                "pciHostDevices": [
+                  {
+                    "pciVendorSelector": "{{ gpu_vendor_id }}",
+                    "resourceName": "{{ gpu_resource_name }}"
+                  }
+                ]
+              }
+            }
+          }
+        }'
+      when: existing_pci_devices.stdout | trim | length == 0
+      changed_when: true
+
+    - name: Patch KubeVirt — append to existing pciHostDevices
+      ansible.builtin.shell: |
+        kubectl patch kubevirt kubevirt -n kubevirt --type=json -p '[
+          {
+            "op": "add",
+            "path": "/spec/configuration/permittedHostDevices/pciHostDevices/-",
+            "value": {
+              "pciVendorSelector": "{{ gpu_vendor_id }}",
+              "resourceName": "{{ gpu_resource_name }}"
+            }
+          }
+        ]'
+      when: existing_pci_devices.stdout | trim | length > 0
+      changed_when: true
+
+    - name: Label Kubernetes node with GPU resource
+      ansible.builtin.shell: |
+        NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+        kubectl label node "$NODE" nvidia.com/gpu=present --overwrite
+      changed_when: true
+
+# ============================================================
+# Phase 6 — Summary  (gpu-setup only)
+# ============================================================
+- name: Display result summary
+  when: gpu_action | default('setup') == 'setup'
+  ansible.builtin.debug:
+    msg:
+      - "╔══════════════════════════════════════════════════════════════╗"
+      - "║              GPU PASSTHROUGH SETUP — DONE                    ║"
+      - "╚══════════════════════════════════════════════════════════════╝"
+      - ""
+      - "  GRUB updated       : {{ 'APPLIED' if change_grub else 'skipped (already set)' }}"
+      - "  vfio-pci modprobe  : {{ 'APPLIED' if change_vfio_modprobe else 'skipped (already set)' }}"
+      - "  vfio modules-load  : {{ 'APPLIED' if change_vfio_modules else 'skipped (already set)' }}"
+      - "  KubeVirt GPU       : {{ 'APPLIED' if change_kubevirt else 'skipped (already set)' }}"
+      - "  Initramfs rebuilt  : {{ 'YES' if (change_grub or change_vfio_modprobe or change_vfio_modules) else 'no (not needed)' }}"
+      - ""
+      - "{% if reboot_required %}"
+      - "  !! REBOOT NOW to activate IOMMU + vfio-pci binding:"
+      - "       sudo reboot"
+      - ""
+      - "  After reboot, verify with:"
+      - "       sudo dmesg | grep -i iommu"
+      - "       lspci -k -s {{ gpu_pci_slot }}"
+      - "       (Kernel driver in use should be: vfio-pci)"
+      - "{% else %}"
+      - "  No reboot required — GPU already bound to vfio-pci"
+      - "{% endif %}"
+      - ""
+      - "  Deploy Windows 11 with GPU passthrough:"
+      - "    ansible-playbook windows-client-controller.yaml -e action=reinstall -e enable_gpu=true"
+
+# ============================================================
+# Phase 7 — Claim GPU for Windows VM (vfio-pci ← nvidia, no reboot)
+# ============================================================
+- name: GPU claim — switch GPU from nvidia to vfio-pci at runtime
+  when: gpu_action | default('setup') == 'claim'
+  block:
+    - name: Get current GPU VGA driver (claim)
+      ansible.builtin.shell: |
+        basename $(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null) 2>/dev/null || echo "none"
+      register: claim_current_driver
+      changed_when: false
+
+    - name: Show state before claim
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  GPU CLAIM — nvidia → vfio-pci  (no reboot needed)"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  GPU VGA   {{ gpu_pci_slot }}  current driver: {{ claim_current_driver.stdout }}"
+          - "  GPU Audio {{ gpu_audio_slot }}"
+          - "  Plan: stop AI workloads → unload nvidia → bind vfio-pci → start Windows VM"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    - name: Already bound to vfio-pci
+      ansible.builtin.debug:
+        msg: "GPU already bound to vfio-pci — skipping rebind."
+      when: claim_current_driver.stdout == 'vfio-pci'
+
+    - name: Stop AI workloads that hold the GPU (ollama, comfyui, pytorch)
+      ansible.builtin.shell: |
+        systemctl stop ollama 2>/dev/null && echo "stopped: ollama" || echo "not running: ollama"
+        pkill -f comfyui 2>/dev/null && echo "stopped: comfyui" || echo "not running: comfyui"
+        pkill -f "python.*torch" 2>/dev/null && echo "stopped: torch processes" || echo "not running: torch"
+        sleep 1
+      changed_when: false
+      ignore_errors: true
+      when: claim_current_driver.stdout != 'vfio-pci'
+
+    - name: Unload nvidia kernel modules (dependency order)
+      ansible.builtin.shell: |
+        for mod in nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
+          if lsmod | grep -q "^${mod} "; then
+            rmmod "$mod" 2>/dev/null || modprobe -r "$mod" 2>/dev/null || true
+            echo "unloaded: $mod"
+          fi
+        done
+        echo "done"
+      register: unload_result
+      changed_when: true
+      when: claim_current_driver.stdout != 'vfio-pci'
+
+    - name: Unbind GPU VGA + Audio from current driver
+      ansible.builtin.shell: |
+        echo "{{ gpu_pci_slot }}" > /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver/unbind 2>/dev/null || true
+        echo "{{ gpu_audio_slot }}" > /sys/bus/pci/devices/{{ gpu_audio_slot }}/driver/unbind 2>/dev/null || true
+        sleep 1
+        echo "unbound"
+      changed_when: true
+      when: claim_current_driver.stdout != 'vfio-pci'
+
+    - name: Ensure vfio modules are loaded
+      ansible.builtin.shell: |
+        modprobe vfio
+        modprobe vfio_iommu_type1
+        modprobe vfio-pci
+        echo "loaded"
+      changed_when: true
+      when: claim_current_driver.stdout != 'vfio-pci'
+
+    - name: Bind GPU to vfio-pci
+      ansible.builtin.shell: |
+        # Register IDs so vfio-pci driver claims them
+        echo "{{ gpu_vendor_id | replace(':', ' ') }}" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/dev/null || true
+        echo "{{ gpu_audio_id | replace(':', ' ') }}" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/dev/null || true
+        sleep 1
+        # Explicit bind in case new_id did not auto-claim
+        echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+        echo "{{ gpu_audio_slot }}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+        sleep 1
+        drv=$(basename $(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null) 2>/dev/null || echo "none")
+        echo "GPU driver is now: $drv"
+      register: claim_bind_result
+      changed_when: true
+      when: claim_current_driver.stdout != 'vfio-pci'
+
+    - name: Start Windows 11 VM
+      ansible.builtin.shell: |
+        virtctl start {{ vm_name | default('win11client') }} \
+          -n {{ kubevirt_namespace | default('default') }} 2>/dev/null || \
+        kubectl patch vm {{ vm_name | default('win11client') }} \
+          -n {{ kubevirt_namespace | default('default') }} \
+          --type merge -p '{"spec":{"running":true}}'
+        echo "VM start requested"
+      changed_when: true
+      ignore_errors: true
+
+    - name: Claim summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ GPU CLAIMED for Windows VM"
+          - "   {{ claim_bind_result.stdout | default('already bound to vfio-pci') }}"
+          - ""
+          - "   Windows VM: {{ vm_name | default('win11client') }} — start requested"
+          - "   Connect:  virtctl vnc {{ vm_name | default('win11client') }} -n {{ kubevirt_namespace | default('default') }}"
+          - ""
+          - "   To release GPU back to Fedora/AI later:"
+          - "     ansible-playbook windows-client-controller.yaml -e action=gpu-release"
+
+# ============================================================
+# Phase 8 — Release GPU back to Fedora desktop/AI (nvidia ← vfio-pci, no reboot)
+# ============================================================
+- name: GPU release — switch GPU from vfio-pci back to nvidia at runtime
+  when: gpu_action | default('setup') == 'release'
+  block:
+    - name: Get current GPU VGA driver (release)
+      ansible.builtin.shell: |
+        basename $(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null) 2>/dev/null || echo "none"
+      register: release_current_driver
+      changed_when: false
+
+    - name: Show state before release
+      ansible.builtin.debug:
+        msg:
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  GPU RELEASE — vfio-pci → nvidia  (no reboot needed)"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          - "  GPU VGA   {{ gpu_pci_slot }}  current driver: {{ release_current_driver.stdout }}"
+          - "  GPU Audio {{ gpu_audio_slot }}"
+          - "  Plan: stop Windows VM → unbind vfio-pci → load nvidia → GPU available to Fedora+CUDA"
+          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    - name: Already bound to nvidia
+      ansible.builtin.debug:
+        msg: "GPU already bound to nvidia — nothing to do."
+      when: release_current_driver.stdout == 'nvidia'
+
+    - name: Stop Windows 11 VM gracefully
+      ansible.builtin.shell: |
+        virtctl stop {{ vm_name | default('win11client') }} \
+          -n {{ kubevirt_namespace | default('default') }} 2>/dev/null || \
+        kubectl patch vm {{ vm_name | default('win11client') }} \
+          -n {{ kubevirt_namespace | default('default') }} \
+          --type merge -p '{"spec":{"running":false}}'
+        echo "stop requested"
+      changed_when: true
+      ignore_errors: true
+      when: release_current_driver.stdout != 'nvidia'
+
+    - name: Wait for Windows VM to stop (up to 60s)
+      ansible.builtin.shell: |
+        for i in $(seq 1 12); do
+          phase=$(kubectl get vmi {{ vm_name | default('win11client') }} \
+            -n {{ kubevirt_namespace | default('default') }} \
+            -o jsonpath='{.status.phase}' 2>/dev/null || echo "gone")
+          [ "$phase" = "gone" ] || [ -z "$phase" ] && echo "VM stopped" && exit 0
+          echo "Waiting for VM stop... phase=$phase ($i/12)"
+          sleep 5
+        done
+        echo "timeout — proceeding with unbind anyway"
+      register: vm_stop_wait
+      changed_when: false
+      ignore_errors: true
+      when: release_current_driver.stdout != 'nvidia'
+
+    - name: Unbind GPU from vfio-pci
+      ansible.builtin.shell: |
+        echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+        echo "{{ gpu_audio_slot }}" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+        # Remove IDs so vfio-pci won't auto-reclaim on next modprobe cycle
+        echo "{{ gpu_vendor_id | replace(':', ' ') }}" > /sys/bus/pci/drivers/vfio-pci/remove_id 2>/dev/null || true
+        echo "{{ gpu_audio_id | replace(':', ' ') }}" > /sys/bus/pci/drivers/vfio-pci/remove_id 2>/dev/null || true
+        sleep 1
+        echo "unbound from vfio-pci"
+      changed_when: true
+      when: release_current_driver.stdout != 'nvidia'
+
+    - name: Load nvidia driver and rebind GPU
+      ansible.builtin.shell: |
+        modprobe nvidia
+        modprobe nvidia_modeset
+        modprobe nvidia_uvm
+        modprobe nvidia_drm modeset=1
+        sleep 1
+        # Explicit bind in case auto-probe did not fire
+        echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null || true
+        sleep 2
+        drv=$(basename $(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null) 2>/dev/null || echo "none")
+        echo "GPU driver is now: $drv"
+      register: nvidia_bind_result
+      changed_when: true
+      when: release_current_driver.stdout != 'nvidia'
+
+    - name: Restart display manager so Fedora desktop picks up the GPU
+      ansible.builtin.shell: |
+        systemctl restart gdm 2>/dev/null && echo "restarted: gdm" || \
+        systemctl restart sddm 2>/dev/null && echo "restarted: sddm" || \
+        systemctl restart lightdm 2>/dev/null && echo "restarted: lightdm" || \
+        echo "no display manager restarted (headless / already using GPU)"
+      changed_when: false
+      ignore_errors: true
+      when: release_current_driver.stdout != 'nvidia'
+
+    - name: Release summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ GPU RELEASED to Fedora / CUDA"
+          - "   {{ nvidia_bind_result.stdout | default('already bound to nvidia') }}"
+          - ""
+          - "   Verify GPU is back:"
+          - "     nvidia-smi"
+          - "     python -c 'import torch; print(torch.cuda.is_available())'"
+          - ""
+          - "   Start AI workloads:"
+          - "     ollama serve"
+          - "     # ComfyUI, Stable Diffusion, any CUDA workload"
+          - ""
+          - "   To reclaim for Windows VM later:"
+          - "     ansible-playbook windows-client-controller.yaml -e action=gpu-claim"
+
