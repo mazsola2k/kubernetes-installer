@@ -62,13 +62,27 @@
   register: vfio_modprobe_content
   when: vfio_modprobe_stat.stat.exists
 
-- name: Detect whether vfio IDs already set
+- name: Check dracut pre-udev hook exists (slot-specific binding)
+  ansible.builtin.stat:
+    path: /usr/lib/dracut/hooks/pre-udev/80-vfio-pci-override.sh
+  register: vfio_dracut_hook_stat
+
+- name: Check dracut.conf.d vfio config exists
+  ansible.builtin.stat:
+    path: /etc/dracut.conf.d/vfio-pci.conf
+  register: vfio_dracut_conf_stat
+
+- name: Detect whether vfio modprobe softdeps are configured
   ansible.builtin.set_fact:
-    vfio_ids_set: >-
+    # Check for the unique marker we write into the correct config.
+    # We check for 'softdep nvidia pre' (present in correct config) and
+    # NOT 'DUAL-GPU-SAFE-NOIDS' marker absence to indicate old id-based config.
+    # Simpler: just check softdep present + unique comment marker.
+    vfio_modprobe_ok: >-
       {{
         vfio_modprobe_stat.stat.exists and
-        gpu_vendor_id in (vfio_modprobe_content.content | default('') | b64decode) and
-        gpu_audio_id in (vfio_modprobe_content.content | default('') | b64decode)
+        'softdep nvidia pre' in (vfio_modprobe_content.content | default('') | b64decode) and
+        'DUAL-GPU-SAFE' in (vfio_modprobe_content.content | default('') | b64decode)
       }}
 
 - name: Check vfio modules-load config
@@ -100,11 +114,12 @@
 - name: Compute what needs to change
   ansible.builtin.set_fact:
     change_grub: "{{ not iommu_in_grub }}"
-    change_vfio_modprobe: "{{ not vfio_ids_set }}"
+    change_vfio_modprobe: "{{ not vfio_modprobe_ok }}"
     change_vfio_modules: "{{ not vfio_modules_stat.stat.exists }}"
+    change_vfio_dracut_hook: "{{ not vfio_dracut_hook_stat.stat.exists }}"
+    change_vfio_dracut_conf: "{{ not vfio_dracut_conf_stat.stat.exists }}"
     change_kubevirt: "{{ gpu_vendor_id not in kubevirt_permitted_devices.stdout }}"
-    reboot_required: "{{ not iommu_in_grub or not vfio_ids_set or not vfio_modules_stat.stat.exists }}"
-    # Space-separated forms needed for /sys/bus/pci/drivers/vfio-pci/new_id and remove_id
+    reboot_required: "{{ not iommu_in_grub or not vfio_modprobe_ok or not vfio_modules_stat.stat.exists or not vfio_dracut_hook_stat.stat.exists }}"
     gpu_vendor_id_space: "{{ gpu_vendor_id | replace(':', ' ') }}"
     gpu_audio_id_space: "{{ gpu_audio_id | replace(':', ' ') }}"
 
@@ -128,8 +143,9 @@
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "  GRUB cmdline    : {{ current_grub_cmdline.stdout }}"
       - "  IOMMU in GRUB   : {{ 'YES' if iommu_in_grub else 'NO' }}"
-      - "  vfio modprobe   : {{ 'exists' if vfio_modprobe_stat.stat.exists else 'MISSING' }}"
-      - "  vfio IDs set    : {{ 'YES' if vfio_ids_set else 'NO' }}"
+      - "  vfio modprobe   : {{ 'OK (no ids=)' if vfio_modprobe_ok else 'MISSING or has ids=' }}"
+      - "  dracut hook     : {{ 'exists' if vfio_dracut_hook_stat.stat.exists else 'MISSING' }}"
+      - "  dracut.conf.d   : {{ 'exists' if vfio_dracut_conf_stat.stat.exists else 'MISSING' }}"
       - "  vfio modules-ld : {{ 'exists' if vfio_modules_stat.stat.exists else 'MISSING' }}"
       - "  GPU VGA driver  : {{ gpu_current_driver.stdout }}"
       - "  GPU Audio driver: {{ gpu_audio_current_driver.stdout }}"
@@ -139,13 +155,16 @@
       - "CHANGES TO APPLY"
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "{% if change_grub %}  [1] MODIFY /etc/default/grub — ADD: {{ iommu_param }} iommu=pt{% else %}  [1] /etc/default/grub — no change needed{% endif %}"
-      - "{% if change_vfio_modprobe %}  [2] CREATE /etc/modprobe.d/vfio-pci.conf: options vfio-pci ids={{ gpu_vendor_id }},{{ gpu_audio_id }} + softdep nvidia pre: vfio-pci{% else %}  [2] /etc/modprobe.d/vfio-pci.conf — no change needed{% endif %}"
-      - "{% if change_vfio_modules %}  [3] CREATE /etc/modules-load.d/vfio-pci.conf: vfio vfio_iommu_type1 vfio-pci{% else %}  [3] /etc/modules-load.d/vfio-pci.conf — no change needed{% endif %}"
-      - "{% if reboot_required %}  [4] dracut --force  (rebuild initramfs){% else %}  [4] dracut — no rebuild needed{% endif %}"
-      - "{% if change_grub %}  [5] grub2-mkconfig  (regenerate GRUB config){% else %}  [5] grub2-mkconfig — no rebuild needed{% endif %}"
-      - "{% if change_kubevirt %}  [6] kubectl patch kubevirt — add PermittedHostDevices ({{ gpu_vendor_id }}){% else %}  [6] KubeVirt PermittedHostDevices — no change needed{% endif %}"
+      - "{% if change_vfio_modprobe %}  [2] CREATE /etc/modprobe.d/vfio-pci.conf: softdep nvidia pre: vfio-pci (NO ids= to protect 2nd GPU){% else %}  [2] /etc/modprobe.d/vfio-pci.conf — no change needed{% endif %}"
+      - "{% if change_vfio_dracut_hook %}  [3] CREATE /usr/lib/dracut/hooks/pre-udev/80-vfio-pci-override.sh (slot-specific: {{ gpu_pci_slot }} only){% else %}  [3] dracut pre-udev hook — no change needed{% endif %}"
+      - "{% if change_vfio_dracut_conf %}  [4] CREATE /etc/dracut.conf.d/vfio-pci.conf (include vfio modules + hook){% else %}  [4] /etc/dracut.conf.d/vfio-pci.conf — no change needed{% endif %}"
+      - "{% if change_vfio_modules %}  [5] CREATE /etc/modules-load.d/vfio-pci.conf: vfio vfio_iommu_type1 vfio-pci{% else %}  [5] /etc/modules-load.d/vfio-pci.conf — no change needed{% endif %}"
+      - "{% if reboot_required %}  [6] dracut --force  (rebuild initramfs){% else %}  [6] dracut — no rebuild needed{% endif %}"
+      - "{% if change_grub %}  [7] grub2-mkconfig  (regenerate GRUB config){% else %}  [7] grub2-mkconfig — no rebuild needed{% endif %}"
+      - "{% if change_kubevirt %}  [8] kubectl patch kubevirt — add PermittedHostDevices ({{ gpu_vendor_id }}){% else %}  [8] KubeVirt PermittedHostDevices — no change needed{% endif %}"
       - ""
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  DUAL-GPU SAFE: Only {{ gpu_pci_slot }} targeted. GPU at 0a:00.0 stays on nvidia for Fedora desktop."
       - "{% if reboot_required %}  *** HOST REBOOT REQUIRED after apply ***{% else %}  No reboot required — IOMMU and vfio-pci already active{% endif %}"
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -157,6 +176,8 @@
     - not change_grub
     - not change_vfio_modprobe
     - not change_vfio_modules
+    - not change_vfio_dracut_hook
+    - not change_vfio_dracut_conf
     - not change_kubevirt
 
 # ============================================================
@@ -172,7 +193,7 @@
   when:
     - gpu_action | default('setup') == 'setup'
     - gpu_confirm | default('no') | lower != 'yes'
-    - change_grub or change_vfio_modprobe or change_vfio_modules or change_kubevirt
+    - change_grub or change_vfio_modprobe or change_vfio_modules or change_vfio_dracut_hook or change_vfio_dracut_conf or change_kubevirt
 
 - name: Abort if user did not confirm
   ansible.builtin.fail:
@@ -180,14 +201,14 @@
   when:
     - gpu_action | default('setup') == 'setup'
     - gpu_confirm | default('no') | lower != 'yes'
-    - change_grub or change_vfio_modprobe or change_vfio_modules or change_kubevirt
+    - change_grub or change_vfio_modprobe or change_vfio_modules or change_vfio_dracut_hook or change_vfio_dracut_conf or change_kubevirt
     - confirmation_result.user_input | default('') | upper != 'YES'
 
 # ============================================================
 # Phase 4 — Apply host-level changes  (gpu-setup only)
 # ============================================================
 - name: Apply host IOMMU / vfio configuration
-  when: (change_grub or change_vfio_modprobe or change_vfio_modules) and (gpu_action | default('setup') == 'setup')
+  when: (change_grub or change_vfio_modprobe or change_vfio_modules or change_vfio_dracut_hook or change_vfio_dracut_conf) and (gpu_action | default('setup') == 'setup')
   block:
     - name: Add IOMMU parameters to GRUB cmdline
       ansible.builtin.lineinfile:
@@ -197,21 +218,46 @@
         backup: yes
       when: change_grub
 
-    - name: Write vfio-pci modprobe configuration
+    - name: Write vfio-pci modprobe configuration (softdeps only — no ids=)
       ansible.builtin.copy:
         dest: /etc/modprobe.d/vfio-pci.conf
         mode: '0644'
         content: |
-          # vfio-pci GPU passthrough — NVIDIA GeForce RTX 3090
-          # VGA  {{ gpu_vendor_id }}   Audio  {{ gpu_audio_id }}
-          options vfio-pci ids={{ gpu_vendor_id }},{{ gpu_audio_id }}
+          # DUAL-GPU-SAFE: vfio-pci GPU passthrough via slot-specific dracut hook
+          # Target: NVIDIA GeForce RTX 3090 @ {{ gpu_pci_slot }} ONLY
+          # The second RTX 3090 at 0a:00.0 is intentionally left for Fedora desktop.
+          # Slot-specific binding is handled by the dracut pre-udev hook.
 
-          # Ensure vfio-pci claims the GPU before nvidia loads
+          # Ensure vfio-pci loads before nvidia so driver_override takes effect
           softdep nvidia pre: vfio-pci
           softdep nvidia_drm pre: vfio-pci
           softdep nvidia_modeset pre: vfio-pci
           softdep nvidia_uvm pre: vfio-pci
       when: change_vfio_modprobe
+
+    - name: Create dracut pre-udev hook for slot-specific GPU binding
+      ansible.builtin.copy:
+        dest: /usr/lib/dracut/hooks/pre-udev/80-vfio-pci-override.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Bind ONLY {{ gpu_pci_slot }} + {{ gpu_audio_slot }} to vfio-pci.
+          # GPU at 0a:00.0 is left for the Fedora host desktop / AI workloads.
+          for DEV in {{ gpu_pci_slot }} {{ gpu_audio_slot }}; do
+              echo "vfio-pci" > /sys/bus/pci/devices/${DEV}/driver_override
+          done
+          modprobe -i vfio-pci
+      when: change_vfio_dracut_hook
+
+    - name: Create dracut.conf.d to include vfio modules and hook in initramfs
+      ansible.builtin.copy:
+        dest: /etc/dracut.conf.d/vfio-pci.conf
+        mode: '0644'
+        content: |
+          # Include vfio-pci modules and the slot-override hook in initramfs
+          add_drivers+=" vfio vfio_iommu_type1 vfio-pci "
+          install_items+=" /usr/lib/dracut/hooks/pre-udev/80-vfio-pci-override.sh "
+      when: change_vfio_dracut_conf
 
     - name: Write vfio modules-load configuration
       ansible.builtin.copy:
@@ -226,6 +272,7 @@
     - name: Rebuild initramfs (dracut --force)
       ansible.builtin.shell: dracut --force
       changed_when: true
+      when: change_grub or change_vfio_modprobe or change_vfio_dracut_hook or change_vfio_dracut_conf or change_vfio_modules
 
     - name: Detect GRUB config output path
       ansible.builtin.shell: |
