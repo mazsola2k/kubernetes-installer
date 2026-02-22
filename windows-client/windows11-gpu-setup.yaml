@@ -180,7 +180,7 @@
       - "  Host GPU : NVIDIA GeForce RTX 3090 ({{ gpu_pci_slot }})"
       - "  PCI IDs  : VGA={{ gpu_vendor_id }}   Audio={{ gpu_audio_id }}"
       - "  CPU      : {{ cpu_vendor.stdout }} → kernel params: {{ (iommu_param ~ ' ') if iommu_param else '' }}iommu=pt"
-      - "  BIOS IOMMU : {{ bios_iommu_table.stdout if bios_iommu_enabled else 'NOT DETECTED — enable AMD-Vi / VT-d in BIOS!' }}"
+      - "  BIOS IOMMU : {{ bios_iommu_table.stdout if bios_iommu_enabled else 'NOT DETECTED — enable IOMMU in BIOS! (AMD: CBS → NBIO → IOMMU)' }}"
       - ""
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "CURRENT STATE"
@@ -208,8 +208,8 @@
       - ""
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
       - "  DUAL-GPU SAFE: Only {{ gpu_pci_slot }} targeted. GPU at 0a:00.0 stays on nvidia for Fedora desktop."
-      - "{% if not bios_iommu_enabled %}  ⚠ BIOS IOMMU NOT ENABLED — GPU passthrough WILL NOT WORK until you enable AMD-Vi (or VT-d) in BIOS firmware setup!{% endif %}"
-      - "{% if not bios_iommu_enabled %}    → Reboot into BIOS (Del/F2), enable AMD-Vi/IOMMU (Gigabyte: Settings → AMD CBS → NBIO → IOMMU → Enabled){% endif %}"
+      - "{% if not bios_iommu_enabled %}  ⚠ BIOS IOMMU NOT ENABLED — GPU passthrough WILL NOT WORK until you enable IOMMU in BIOS!{% endif %}"
+      - "{% if not bios_iommu_enabled %}    → Reboot into BIOS (Del/F2): AMD CBS → NBIO → IOMMU → Enabled  (Intel: VT-d){% endif %}"
       - "{% if reboot_required %}  *** HOST REBOOT REQUIRED after apply ***{% elif not bios_iommu_enabled %}  *** BIOS CHANGE + REBOOT REQUIRED ***{% else %}  No reboot required — IOMMU and vfio-pci already active{% endif %}"
       - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -218,7 +218,8 @@
     msg: >-
       GPU passthrough host config is complete — nothing to apply.
       {{ '' if bios_iommu_enabled else
-         '⚠ BUT: BIOS IOMMU is NOT enabled! Enable AMD-Vi/IOMMU in BIOS firmware, then reboot. '
+         '⚠ BUT: BIOS IOMMU is NOT enabled! '
+         'AMD boards: BIOS → AMD CBS → NBIO → IOMMU → Enabled. Intel: enable VT-d. '
          'After reboot verify: sudo dmesg | grep AMD-Vi && ls /sys/kernel/iommu_groups/ | wc -l' }}
   when:
     - gpu_action | default('setup') == 'setup'
@@ -416,7 +417,8 @@
       - ""
       - "{% if not bios_iommu_enabled %}  ⚠ CRITICAL: BIOS IOMMU is NOT enabled! Before rebooting:{% endif %}"
       - "{% if not bios_iommu_enabled %}    1. Enter BIOS firmware setup (Del/F2 at POST){% endif %}"
-      - "{% if not bios_iommu_enabled %}    2. Enable AMD-Vi / IOMMU (Gigabyte: Settings → AMD CBS → NBIO → IOMMU → Enabled){% endif %}"
+      - "{% if not bios_iommu_enabled %}    2. AMD boards: AMD CBS → NBIO → IOMMU → Enabled{% endif %}"
+      - "{% if not bios_iommu_enabled %}       Intel boards: enable VT-d{% endif %}"
       - "{% if not bios_iommu_enabled %}    3. Save & Exit, then verify: sudo dmesg | grep -i 'AMD-Vi\\|IVRS'{% endif %}"
       - "{% if not bios_iommu_enabled %}{% endif %}"
       - "  After reboot, verify with:"
@@ -436,9 +438,10 @@
     msg:
       - "  Host config is complete, but BIOS IOMMU is NOT enabled."
       - ""
-      - "  ⚠ REQUIRED: Enable AMD-Vi / IOMMU in BIOS firmware:"
+      - "  ⚠ REQUIRED: Enable IOMMU in BIOS firmware:"
       - "    1. Reboot → enter BIOS (Del or F2 at POST)"
-      - "    2. Gigabyte: Settings → AMD CBS → NBIO Common Options → IOMMU → Enabled"
+      - "    2. AMD boards: AMD CBS → NBIO → IOMMU → Enabled"
+      - "       Intel boards: enable VT-d"
       - "    3. Save & Exit → boot into Fedora"
       - ""
       - "  After BIOS change + reboot, verify:"
@@ -537,14 +540,25 @@
     - name: Bind GPU to vfio-pci
       ansible.builtin.shell:
         cmd: |
+          # Set driver_override=vfio-pci explicitly (gpu-release may have cleared it)
+          # and in fresh sessions where the dracut hook hasn't run yet.
+          echo "vfio-pci" > /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver_override
+          echo "vfio-pci" > /sys/bus/pci/devices/{{ gpu_audio_slot }}/driver_override
+          # Register PCI IDs with vfio-pci (already present after boot → || true is safe)
           echo "{{ gpu_vendor_id_space }}" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/dev/null || true
           echo "{{ gpu_audio_id_space }}" > /sys/bus/pci/drivers/vfio-pci/new_id 2>/dev/null || true
           sleep 1
-          echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
-          echo "{{ gpu_audio_slot }}" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+          echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/vfio-pci/bind 2>&1
+          echo "{{ gpu_audio_slot }}" > /sys/bus/pci/drivers/vfio-pci/bind 2>&1
           sleep 1
           drv=$(basename $(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null) 2>/dev/null || echo "none")
-          echo "GPU driver is now: $drv"
+          if [ "$drv" = "vfio-pci" ]; then
+            echo "GPU driver is now: $drv ✓"
+          else
+            echo "ERROR: expected vfio-pci, got '$drv'"
+            dmesg | grep -i "03:00.0\|vfio" | tail -5
+            exit 1
+          fi
       register: claim_bind_result
       changed_when: true
       when: claim_current_driver.stdout != 'vfio-pci'
@@ -552,12 +566,11 @@
     - name: Start Windows 11 VM
       ansible.builtin.shell:
         cmd: |
-          virtctl start {{ vm_name | default('win11client') }} \
-            -n {{ kubevirt_namespace | default('default') }} 2>/dev/null || \
-          kubectl patch vm {{ vm_name | default('win11client') }} \
-            -n {{ kubevirt_namespace | default('default') }} \
-            --type merge -p '{"spec":{"running":true}}'
-          echo "VM start requested"
+          # virtctl start works with both spec.running and runStrategy VMs.
+          # Ignore "already running" errors (exit 0 if started, non-zero if already up).
+          out=$(virtctl start {{ vm_name | default('win11client') }} \
+            -n {{ kubevirt_namespace | default('default') }} 2>&1) && echo "VM start requested" \
+            || echo "VM already running or start pending: $out"
       changed_when: true
       ignore_errors: true
 
@@ -604,12 +617,9 @@
     - name: Stop Windows 11 VM gracefully
       ansible.builtin.shell:
         cmd: |
-          virtctl stop {{ vm_name | default('win11client') }} \
-            -n {{ kubevirt_namespace | default('default') }} 2>/dev/null || \
-          kubectl patch vm {{ vm_name | default('win11client') }} \
-            -n {{ kubevirt_namespace | default('default') }} \
-            --type merge -p '{"spec":{"running":false}}'
-          echo "stop requested"
+          out=$(virtctl stop {{ vm_name | default('win11client') }} \
+            -n {{ kubevirt_namespace | default('default') }} 2>&1) && echo "stop requested" \
+            || echo "VM already stopped or stop pending: $out"
       changed_when: true
       ignore_errors: true
       when: release_current_driver.stdout != 'nvidia'
@@ -631,30 +641,70 @@
       ignore_errors: true
       when: release_current_driver.stdout != 'nvidia'
 
-    - name: Unbind GPU from vfio-pci
+    - name: Unbind GPU from vfio-pci and clear driver_override
       ansible.builtin.shell:
         cmd: |
           echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
           echo "{{ gpu_audio_slot }}" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
           echo "{{ gpu_vendor_id_space }}" > /sys/bus/pci/drivers/vfio-pci/remove_id 2>/dev/null || true
           echo "{{ gpu_audio_id_space }}" > /sys/bus/pci/drivers/vfio-pci/remove_id 2>/dev/null || true
+          # CRITICAL: clear driver_override so nvidia can claim the device
+          # The dracut hook sets driver_override=vfio-pci at boot; without clearing
+          # it, nvidia bind silently fails (echoes to the file but device rejects bind)
+          echo "" > /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver_override 2>/dev/null || true
+          echo "" > /sys/bus/pci/devices/{{ gpu_audio_slot }}/driver_override 2>/dev/null || true
           sleep 1
-          echo "unbound from vfio-pci"
+          echo "unbound from vfio-pci, driver_override cleared"
+      changed_when: true
+      when: release_current_driver.stdout != 'nvidia'
+
+    - name: Reset GPU via parent bridge SBR to clear dirty QEMU hardware state
+      # After QEMU releases a vfio-pci device, the GPU is left in a dirty state:
+      # NVIDIA GSP firmware did not shut down cleanly, so nvidia driver init fails
+      # with 'kgspWaitForGfwBootOk_TU102: failed to wait for GFW boot complete'.
+      # Solution: trigger Secondary Bus Reset (SBR) via the parent PCIe bridge,
+      # which performs a full hardware reset of everything on that bus.
+      # Parent bridge is computed dynamically from the GPU sysfs symlink.
+      ansible.builtin.shell:
+        cmd: |
+          GPU="{{ gpu_pci_slot }}"
+          PARENT=$(basename $(dirname $(readlink /sys/bus/pci/devices/$GPU 2>/dev/null)) 2>/dev/null)
+          echo "GPU parent bridge: $PARENT"
+          if [ -f "/sys/bus/pci/devices/$PARENT/reset" ]; then
+            echo "Triggering Secondary Bus Reset (SBR) on $PARENT"
+            echo 1 > /sys/bus/pci/devices/$PARENT/reset
+            sleep 2
+            echo "SBR complete — GPU hardware state cleared"
+          elif [ -f "/sys/bus/pci/devices/$GPU/reset" ]; then
+            echo "No parent bridge reset, falling back to FLR on $GPU"
+            echo 1 > /sys/bus/pci/devices/$GPU/reset
+            sleep 1
+            echo "FLR complete"
+          else
+            echo "WARNING: No reset method available — nvidia GSP init may fail"
+          fi
+      register: gpu_sbr_result
       changed_when: true
       when: release_current_driver.stdout != 'nvidia'
 
     - name: Load nvidia driver and rebind GPU
       ansible.builtin.shell:
         cmd: |
-          modprobe nvidia
-          modprobe nvidia_modeset
-          modprobe nvidia_uvm
-          modprobe nvidia_drm modeset=1
+          modprobe nvidia 2>/dev/null || true
+          modprobe nvidia_modeset 2>/dev/null || true
+          modprobe nvidia_uvm 2>/dev/null || true
+          modprobe nvidia_drm modeset=1 2>/dev/null || true
           sleep 1
-          echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/nvidia/bind 2>/dev/null || true
-          sleep 2
+          echo "{{ gpu_pci_slot }}" > /sys/bus/pci/drivers/nvidia/bind 2>&1
+          sleep 3
           drv=$(basename $(readlink /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null) 2>/dev/null || echo "none")
-          echo "GPU driver is now: $drv"
+          if [ "$drv" = "nvidia" ]; then
+            echo "GPU driver is now: $drv ✓"
+          else
+            echo "ERROR: expected nvidia, got '$drv'"
+            dmesg | grep -i "03:00.0\|kgsp\|RmInitAdapter" | tail -5
+            exit 1
+          fi
       register: nvidia_bind_result
       changed_when: true
       when: release_current_driver.stdout != 'nvidia'
@@ -674,7 +724,8 @@
       ansible.builtin.debug:
         msg:
           - "✅ GPU RELEASED to Fedora / CUDA"
-          - "   {{ nvidia_bind_result.stdout | default('already bound to nvidia') }}"
+          - "   Reset: {{ gpu_sbr_result.stdout_lines | default(['skipped']) | join(' | ') }}"
+          - "   Bind:  {{ nvidia_bind_result.stdout | default('already bound to nvidia') }}"
           - ""
           - "   Verify GPU is back:"
           - "     nvidia-smi"

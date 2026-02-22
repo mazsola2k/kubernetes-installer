@@ -1,0 +1,36 @@
+// KubeVirt hook v1alpha2 Callbacks service — exact copy of:
+// github.com/kubevirt/kubevirt/pkg/hooks/v1alpha2/api_v1alpha2.proto
+syntax = "proto3";
+
+package kubevirt.hooks.v1alpha2;
+
+// gRPC method paths:
+//   /kubevirt.hooks.v1alpha2.Callbacks/OnDefineDomain
+//   /kubevirt.hooks.v1alpha2.Callbacks/PreCloudInitIso
+service Callbacks {
+    rpc OnDefineDomain (OnDefineDomainParams) returns (OnDefineDomainResult);
+    rpc PreCloudInitIso (PreCloudInitIsoParams) returns (PreCloudInitIsoResult);
+}
+
+message OnDefineDomainParams {
+    // domainXML is the original libvirt domain specification
+    bytes domainXML = 1;
+    // vmi is the VirtualMachineInstance object encoded as JSON
+    bytes vmi = 2;
+}
+
+message OnDefineDomainResult {
+    // domainXML is the (potentially modified) libvirt domain specification
+    bytes domainXML = 1;
+}
+
+message PreCloudInitIsoParams {
+    bytes cloudInitNoCloudSource = 1;
+    bytes vmi = 2;
+    bytes cloudInitData = 3;
+}
+
+message PreCloudInitIsoResult {
+    bytes cloudInitNoCloudSource = 1;
+    bytes cloudInitData = 3;
+}

@@ -1,0 +1,388 @@
+---
+# KVM Direct Test Playbook for GPU Passthrough
+# Purpose: Test NVIDIA RTX 3090 passthrough outside KubeVirt with full parameter control
+# Usage:
+#   ansible-playbook windows-client/windows11-kvm-test.yaml -e action=start
+#   ansible-playbook windows-client/windows11-kvm-test.yaml -e action=stop
+#   ansible-playbook windows-client/windows11-kvm-test.yaml -e action=status
+#
+# Optional variables:
+#   -e gpu_romfile=/path/to/vbios.rom    # Supply a VBIOS ROM file (from TechPowerUp)
+#   -e gpu_rombar=1                      # Enable ROM BAR (default: 0 = disabled)
+#   -e vnc_port=5901                     # VNC listen port (default: 5901)
+#   -e vm_memory=8G                      # RAM (default: 8G)
+#   -e vm_cpus=4                         # vCPUs (default: 4)
+#   -e enable_ioapic=true                # kernel-irqchip=on (default: true)
+#   -e hide_kvm=true                     # Hide KVM from guest (default: true)
+#
+# Connect via VNC: vncviewer <host>:5901
+#
+- name: KVM Direct GPU Passthrough Test
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+
+  vars:
+    action: "start"
+    # VM resource settings
+    vm_memory: "8G"
+    vm_cpus: 4
+    vm_name: "win11-kvm-test"
+    # Disk image path (same as KubeVirt VM)
+    disk_image: "/var/lib/kubevirt/win11client-system-disk/disk.img"
+    disk_format: "raw"
+    # OVMF firmware
+    ovmf_code: "/usr/share/edk2/ovmf/OVMF_CODE.fd"
+    ovmf_vars_template: "/usr/share/edk2/ovmf/OVMF_VARS.fd"
+    ovmf_vars_copy: "/var/lib/kubevirt/kvm-test-OVMF_VARS.fd"
+    # GPU passthrough settings
+    gpu_pci_slot: "0000:03:00.0"
+    gpu_audio_slot: "0000:03:00.1"
+    gpu_romfile: ""
+    gpu_rombar: 0
+    # Optional: Windows installer ISO (supply to install Windows fresh)
+    # Example: -e installer_iso=/var/lib/kubevirt/win11client-installer-iso/win11client.iso
+    installer_iso: ""
+    virtio_iso: ""
+    # Anti-detection / KVM hiding
+    hide_kvm: true
+    vendor_id: "ntg0npov91om"
+    enable_ioapic: true
+    # Display - VNC
+    vnc_display: ":1"
+    vnc_port: 5901
+    # QEMU binary
+    qemu_binary: "/usr/bin/qemu-system-x86_64"
+    # PID file for process management
+    pid_file: "/var/run/{{ vm_name }}.pid"
+    # Monitor socket for QEMU management
+    monitor_socket: "/var/run/{{ vm_name }}-monitor.sock"
+
+  tasks:
+    # =========================================================================
+    # Validation
+    # =========================================================================
+    - name: Validate action
+      ansible.builtin.assert:
+        that:
+          - action in ['start', 'stop', 'status']
+        fail_msg: "Invalid action '{{ action }}'. Must be one of: start, stop, status"
+
+    # =========================================================================
+    # STATUS
+    # =========================================================================
+    - name: Check if QEMU process is running
+      ansible.builtin.shell: |
+        if [ -f "{{ pid_file }}" ]; then
+          PID=$(cat "{{ pid_file }}")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "RUNNING (PID $PID)"
+          else
+            echo "STALE_PID"
+            rm -f "{{ pid_file }}"
+          fi
+        else
+          echo "STOPPED"
+        fi
+      register: vm_status
+      changed_when: false
+      tags: [always]
+
+    - name: Display VM status
+      ansible.builtin.debug:
+        msg: |
+          VM: {{ vm_name }}
+          Status: {{ vm_status.stdout }}
+          Disk: {{ disk_image }}
+          GPU: {{ gpu_pci_slot }}
+          VNC: {{ vnc_port }}
+          Monitor: {{ monitor_socket }}
+      when: action == 'status'
+
+    - name: End play for status action
+      ansible.builtin.meta: end_play
+      when: action == 'status'
+
+    # =========================================================================
+    # STOP
+    # =========================================================================
+    - name: Stop KVM VM
+      when: action == 'stop'
+      block:
+        - name: Send shutdown via QEMU monitor
+          ansible.builtin.shell: |
+            if [ -S "{{ monitor_socket }}" ]; then
+              echo "system_powerdown" | socat - UNIX-CONNECT:"{{ monitor_socket }}"
+              echo "Sent ACPI shutdown signal"
+              sleep 5
+            fi
+          register: shutdown_result
+          changed_when: "'Sent ACPI' in shutdown_result.stdout"
+          ignore_errors: true
+
+        - name: Force kill if still running
+          ansible.builtin.shell: |
+            if [ -f "{{ pid_file }}" ]; then
+              PID=$(cat "{{ pid_file }}")
+              if kill -0 "$PID" 2>/dev/null; then
+                kill "$PID"
+                sleep 2
+                if kill -0 "$PID" 2>/dev/null; then
+                  kill -9 "$PID"
+                fi
+                echo "Killed PID $PID"
+              else
+                echo "Process not found"
+              fi
+              rm -f "{{ pid_file }}"
+            else
+              echo "No PID file"
+            fi
+          register: kill_result
+          changed_when: "'Killed' in kill_result.stdout"
+
+        - name: Clean up monitor socket
+          ansible.builtin.file:
+            path: "{{ monitor_socket }}"
+            state: absent
+
+        - name: Display stop result
+          ansible.builtin.debug:
+            msg: "VM {{ vm_name }} stopped. {{ kill_result.stdout }}"
+
+        - name: End play after stop
+          ansible.builtin.meta: end_play
+
+    # =========================================================================
+    # START - Pre-flight checks
+    # =========================================================================
+    - name: Check if VM is already running
+      ansible.builtin.fail:
+        msg: "VM {{ vm_name }} is already running ({{ vm_status.stdout }}). Use action=stop first."
+      when:
+        - action == 'start'
+        - "'RUNNING' in vm_status.stdout"
+
+    - name: Check KubeVirt VM is stopped
+      ansible.builtin.shell: |
+        if command -v kubectl &>/dev/null; then
+          VMI_STATUS=$(kubectl get vmi win11client -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+          if [ "$VMI_STATUS" != "NotFound" ] && [ "$VMI_STATUS" != "" ]; then
+            echo "WARNING: KubeVirt VMI win11client is $VMI_STATUS - it may hold the GPU!"
+            exit 1
+          fi
+          echo "OK: No KubeVirt VMI running"
+        else
+          echo "OK: kubectl not found, skipping check"
+        fi
+      register: kubevirt_check
+      changed_when: false
+      when: action == 'start'
+
+    - name: Verify disk image exists
+      ansible.builtin.stat:
+        path: "{{ disk_image }}"
+      register: disk_stat
+      when: action == 'start'
+
+    - name: Fail if disk image missing
+      ansible.builtin.fail:
+        msg: "Disk image not found: {{ disk_image }}"
+      when:
+        - action == 'start'
+        - not disk_stat.stat.exists
+
+    - name: Verify OVMF firmware exists
+      ansible.builtin.stat:
+        path: "{{ ovmf_code }}"
+      register: ovmf_stat
+      when: action == 'start'
+
+    - name: Fail if OVMF firmware missing
+      ansible.builtin.fail:
+        msg: "OVMF firmware not found: {{ ovmf_code }}. Install: dnf install edk2-ovmf"
+      when:
+        - action == 'start'
+        - not ovmf_stat.stat.exists
+
+    - name: Verify GPU is bound to vfio-pci
+      ansible.builtin.shell: |
+        DRIVER=$(readlink -f /sys/bus/pci/devices/{{ gpu_pci_slot }}/driver 2>/dev/null | xargs basename 2>/dev/null)
+        if [ "$DRIVER" = "vfio-pci" ]; then
+          echo "OK: {{ gpu_pci_slot }} bound to vfio-pci"
+        else
+          echo "ERROR: {{ gpu_pci_slot }} bound to '$DRIVER' (expected vfio-pci)"
+          exit 1
+        fi
+      register: gpu_driver_check
+      changed_when: false
+      when: action == 'start'
+
+    - name: Verify GPU audio is bound to vfio-pci
+      ansible.builtin.shell: |
+        DRIVER=$(readlink -f /sys/bus/pci/devices/{{ gpu_audio_slot }}/driver 2>/dev/null | xargs basename 2>/dev/null)
+        if [ "$DRIVER" = "vfio-pci" ]; then
+          echo "OK: {{ gpu_audio_slot }} bound to vfio-pci"
+        else
+          echo "WARNING: {{ gpu_audio_slot }} bound to '$DRIVER' (expected vfio-pci)"
+        fi
+      register: gpu_audio_check
+      changed_when: false
+      when: action == 'start'
+
+    - name: Check for optional ROM file
+      ansible.builtin.stat:
+        path: "{{ gpu_romfile }}"
+      register: romfile_stat
+      when:
+        - action == 'start'
+        - gpu_romfile | length > 0
+
+    - name: Warning if ROM file specified but missing
+      ansible.builtin.debug:
+        msg: "WARNING: ROM file '{{ gpu_romfile }}' not found. Proceeding with rombar={{ gpu_rombar }}"
+      when:
+        - action == 'start'
+        - gpu_romfile | length > 0
+        - not romfile_stat.stat.exists
+
+    # =========================================================================
+    # START - Prepare OVMF VARS copy
+    # =========================================================================
+    - name: Copy OVMF VARS template (writable copy for this VM)
+      ansible.builtin.copy:
+        src: "{{ ovmf_vars_template }}"
+        dest: "{{ ovmf_vars_copy }}"
+        force: false
+        mode: '0644'
+      when: action == 'start'
+
+    # =========================================================================
+    # START - Build QEMU command and launch
+    # =========================================================================
+    - name: Build QEMU command line
+      when: action == 'start'
+      block:
+        - name: Set CPU flags
+          ansible.builtin.set_fact:
+            cpu_model: >-
+              host,+topoext,+invtsc{%
+              if hide_kvm | bool %},kvm=off{% endif %}{%
+              if hide_kvm | bool %},hv_vendor_id={{ vendor_id }}{% endif
+              %},hv_relaxed,hv_spinlocks=0x1000,hv_vapic,hv_time,hv_runtime,hv_synic,hv_reset,hv_vpindex,hv_tlbflush,hv_ipi
+
+        - name: Set machine type
+          ansible.builtin.set_fact:
+            machine_type: >-
+              q35,accel=kvm{% if enable_ioapic | bool %},kernel-irqchip=on{% endif %}
+
+        - name: Build GPU VGA device string
+          # x-vga=on is intentionally OFF: we use -vga std for VNC/OVMF display.
+          # The GPU is still fully passed through for Windows to use (Code 43 test).
+          # x-vga=on would steal VGA arbitration → VNC goes blank after GPU POST.
+          ansible.builtin.set_fact:
+            gpu_vga_device: >-
+              vfio-pci,host={{ gpu_pci_slot | regex_replace('^0000:', '') }},multifunction=on{%
+              if gpu_romfile | length > 0 and (romfile_stat.stat.exists | default(false))
+              %},romfile={{ gpu_romfile }}{% endif %}{%
+              if not (gpu_romfile | length > 0 and (romfile_stat.stat.exists | default(false)))
+              %},rombar={{ gpu_rombar }}{% endif %}
+
+        - name: Build GPU audio device string
+          ansible.builtin.set_fact:
+            gpu_audio_device: >-
+              vfio-pci,host={{ gpu_audio_slot | regex_replace('^0000:', '') }}
+
+        - name: Assemble full QEMU command
+          ansible.builtin.set_fact:
+            qemu_cmd: >-
+              {{ qemu_binary }}
+              -name {{ vm_name }}
+              -machine {{ machine_type | trim }}
+              -cpu {{ cpu_model | trim }}
+              -smp {{ vm_cpus }},sockets=1,cores={{ vm_cpus }},threads=1
+              -m {{ vm_memory }}
+              -enable-kvm
+              -drive if=pflash,format=raw,readonly=on,file={{ ovmf_code }}
+              -drive if=pflash,format=raw,file={{ ovmf_vars_copy }}
+              -drive file={{ disk_image }},format={{ disk_format }},if=none,id=disk0,cache=none,aio=native,discard=unmap
+              -device virtio-blk-pci,drive=disk0,bootindex=1{% if installer_iso | length > 0 or virtio_iso | length > 0 %}
+              -device ich9-ahci,id=ahci{% endif %}{% if installer_iso | length > 0 %}
+              -drive file={{ installer_iso }},media=cdrom,if=none,id=cdrom0,readonly=on
+              -device ide-cd,drive=cdrom0,bus=ahci.0,bootindex=2{% endif %}{% if virtio_iso | length > 0 %}
+              -drive file={{ virtio_iso }},media=cdrom,if=none,id=cdrom1,readonly=on
+              -device ide-cd,drive=cdrom1,bus=ahci.1{% endif %}
+              -device {{ gpu_vga_device | trim }}
+              -device {{ gpu_audio_device | trim }}
+              -device virtio-net-pci,netdev=net0
+              -netdev user,id=net0,hostfwd=tcp::3389-:3389
+              -device usb-ehci,id=ehci
+              -device usb-tablet,bus=ehci.0
+              -vnc {{ vnc_display }}
+              -vga std
+              -monitor unix:{{ monitor_socket }},server,nowait
+              -pidfile {{ pid_file }}
+              -daemonize
+
+        - name: Display QEMU command
+          ansible.builtin.debug:
+            msg: |
+              ============================================================
+              QEMU Command Line:
+              ============================================================
+              {{ qemu_cmd | trim }}
+              ============================================================
+
+              Configuration:
+                Machine: q35 + KVM
+                CPU: host ({{ vm_cpus }} cores, {{ vm_memory }} RAM)
+                Disk: {{ disk_image }} ({{ disk_format }})
+                GPU: {{ gpu_pci_slot }} (x-vga=off, rombar={{ gpu_rombar }}{% if gpu_romfile | length > 0 %}, romfile={{ gpu_romfile }}{% endif %})
+                ISO: {% if installer_iso | length > 0 %}{{ installer_iso }}{% else %}none (supply: -e installer_iso=...){% endif %}
+                GPU Audio: {{ gpu_audio_slot }}
+                KVM Hidden: {{ hide_kvm }}
+                IOAPIC KVM: {{ enable_ioapic }} (kernel-irqchip=on)
+                Vendor ID: {{ vendor_id }}
+                VNC: port {{ vnc_port }}
+                RDP forward: localhost:3389 -> guest:3389
+                Monitor: {{ monitor_socket }}
+              ============================================================
+
+    - name: Start QEMU VM
+      ansible.builtin.shell: "{{ qemu_cmd | trim }}"
+      register: qemu_start
+      when: action == 'start'
+
+    - name: Wait for QEMU to start
+      ansible.builtin.pause:
+        seconds: 3
+      when: action == 'start'
+
+    - name: Verify QEMU is running
+      ansible.builtin.shell: |
+        if [ -f "{{ pid_file }}" ]; then
+          PID=$(cat "{{ pid_file }}")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "SUCCESS: VM {{ vm_name }} running as PID $PID"
+            echo "VNC: connect to port {{ vnc_port }}"
+            echo "RDP: connect to localhost:3389"
+            echo "Monitor: socat - UNIX-CONNECT:{{ monitor_socket }}"
+            echo "Stop: ansible-playbook windows-client/windows11-kvm-test.yaml -e action=stop"
+          else
+            echo "FAILED: Process not running"
+            cat "{{ pid_file }}"
+            exit 1
+          fi
+        else
+          echo "FAILED: No PID file created"
+          exit 1
+        fi
+      register: verify_result
+      changed_when: false
+      when: action == 'start'
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg: "{{ verify_result.stdout_lines }}"
+      when: action == 'start'

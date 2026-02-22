@@ -1,0 +1,50 @@
+// KubeVirt hooks v1alpha2 proto
+// Source: https://github.com/kubevirt/kubevirt/blob/main/pkg/hooks/v1alpha2/api.proto
+syntax = "proto3";
+
+package kubevirt.io.hooks.v1alpha2;
+
+option go_package = "kubevirt.io/kubevirt/pkg/hooks/v1alpha2";
+
+// ---------------------------------------------------------------------------
+// Info service - called by virt-launcher to discover which hooks this sidecar
+// implements.
+// ---------------------------------------------------------------------------
+service Info {
+    rpc Info(infoParams) returns (infoResult);
+}
+
+message infoParams {}
+
+message infoResult {
+    repeated string supportedHookPoints = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Callbacks service - called by virt-launcher at VM lifecycle events.
+// ---------------------------------------------------------------------------
+service Callbacks {
+    rpc OnDefineDomain(VMIAndDomainSpecParams) returns (domainSpecResponse);
+    rpc PreCloudInitIso(cloudInitIsoParams) returns (cloudInitIsoResponse);
+}
+
+message VMIAndDomainSpecParams {
+    // VMI object serialised as JSON
+    bytes vmi = 1;
+    // libvirt domain XML as UTF-8 bytes
+    bytes domainSpec = 2;
+}
+
+message domainSpecResponse {
+    // Modified (or unchanged) libvirt domain XML
+    bytes domainSpec = 1;
+}
+
+message cloudInitIsoParams {
+    bytes vmi = 1;
+    bytes cloudInitData = 2;
+}
+
+message cloudInitIsoResponse {
+    bytes cloudInitData = 1;
+}

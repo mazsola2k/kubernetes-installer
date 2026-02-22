@@ -1,0 +1,29 @@
+// KubeVirt hook Info service — exact copy of:
+// github.com/kubevirt/kubevirt/pkg/hooks/info/api_info.proto
+syntax = "proto3";
+
+package kubevirt.hooks.info;
+
+// gRPC method path: /kubevirt.hooks.info.Info/Info
+service Info {
+    rpc Info (InfoParams) returns (InfoResult);
+}
+
+message InfoParams {
+}
+
+message InfoResult {
+    // name of the hook sidecar, used by virt-launcher to match requested hooks
+    string name = 1;
+    // hookPoints is a list of subscribed hook points
+    repeated HookPoint hookPoints = 3;
+    // versions is a list of implemented Callbacks service API versions
+    repeated string versions = 4;
+}
+
+message HookPoint {
+    // name of the hook point (e.g. "OnDefineDomain")
+    string name = 1;
+    // priority for ordering multiple hooks (lower = higher priority)
+    int32 priority = 2;
+}

@@ -1,7 +1,7 @@
 ---
-# Windows 11 Client Install Tasks
+# Windows 11 Client Install Tasks - NO GPU variant
 # No Vault integration - credentials passed directly via variables.
-# Customised from windows-server-2025-install.yaml for Windows 11 Pro/Enterprise.
+# Customised from windows11-install.yaml - GPU passthrough disabled.
 
 - name: Set kubevirt_namespace default if not provided
   ansible.builtin.set_fact:
@@ -123,7 +123,7 @@
         msg:
           - "📁 Storage directory: {{ storage_dir | default('/var/lib/kubevirt') }}"
           - "💾 Available space: {{ available_space.stdout }}"
-          - "� ISO file size: {{ (iso_file_final_check.stat.size / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "💿 ISO file size: {{ (iso_file_final_check.stat.size / 1024 / 1024 / 1024) | round(2) }} GB"
 
     - name: Ensure xorriso is installed (needed for mkisofs-compatible ISO creation)
       ansible.builtin.package:
@@ -669,9 +669,10 @@
     - name: Display unattend configuration summary
       ansible.builtin.debug:
         msg:
-          - "📋 Unattend.xml Configuration (Windows 11):"
+          - "📋 Unattend.xml Configuration (Windows 11 - NO GPU):"
           - "  - Admin Password: (set via windows_admin_password var)"
           - "  - TPM/SecureBoot/RAM bypass: enabled"
+          - "  - GPU passthrough: DISABLED"
           - "  - Sysprep Secret: {{ vm_name }}-sysprep"
 
 # ============================================================
@@ -789,28 +790,11 @@
       loop: "{{ pvc_resources }}"
 
 # ============================================================
-# Deploy Windows 11 VM
+# Deploy Windows 11 VM (NO GPU)
 # ============================================================
-- name: Deploy Windows 11 VM
+- name: Deploy Windows 11 VM (no GPU)
   block:
-    - name: Enable KubeVirt GPU feature gate
-      # Required for gpus: device passthrough. Idempotent — safe to run every time.
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: kubevirt.io/v1
-          kind: KubeVirt
-          metadata:
-            name: kubevirt
-            namespace: kubevirt
-          spec:
-            configuration:
-              developerConfiguration:
-                featureGates:
-                  - GPU
-      when: enable_gpu | default(false) | bool
-
-    - name: Build VirtualMachine definition (UEFI, Windows 11)
+    - name: Build VirtualMachine definition (UEFI, Windows 11, no GPU)
       ansible.builtin.set_fact:
         vm_definition:
           apiVersion: kubevirt.io/v1
@@ -845,17 +829,12 @@
                   firmware:
                     bootloader:
                       efi:
-                        # SecureBoot disabled for KubeVirt compatibility; TPM bypass via LabConfig
                         secureBoot: false
                     smm:
                       enabled: true
                   features:
                     acpi: {}
                     apic: {}
-                    # ioapic.driver: kvm = kernel-irqchip=on in QEMU
-                    # Required for correct interrupt routing with GPU passthrough (prevents IRQ storms)
-                    ioapic:
-                      driver: kvm
                     hyperv:
                       relaxed: {}
                       vapic: {}
@@ -902,8 +881,6 @@
                         cdrom:
                           bus: sata
                         bootOrder: 3
-                      # sysprep CDROM omitted during install phase - it injects a second
-                      # Autounattend.xml that can confuse Windows PE answer file precedence.
                     interfaces:
                       - name: default
                         masquerade: {}
@@ -928,100 +905,6 @@
                   - name: virtio-iso
                     persistentVolumeClaim:
                       claimName: "{{ vm_name }}-virtio-iso-pvc"
-
-    - name: Add GPU passthrough to VM definition
-      # Merges kvm.hidden + hyperv.vendorid + GPU device into the spec only when enable_gpu=true.
-      # kvm.hidden: true hides KVM CPUID signature from NVIDIA drivers (prevents Code 43).
-      # hyperv.vendorid: spoofs the hypervisor vendor ID - NVIDIA driver checks this on top of
-      #   the KVM CPUID; setting a non-KVM vendor string prevents driver disabling in the VM.
-      # gpu_resource_name defaults to nvidia.com/RTX_3090 (set in gpu-setup).
-      ansible.builtin.set_fact:
-        vm_definition: >-
-          {{
-            vm_definition | combine({
-              'spec': {
-                'template': {
-                  'spec': {
-                    'domain': {
-                      'features': {
-                        'hyperv': {
-                          'vendorid': {
-                            'enabled': true,
-                            'vendorid': 'ntg0npov91om'
-                          }
-                        },
-                        'kvm': {
-                          'hidden': true
-                        }
-                      },
-                      'devices': {
-                        'gpus': [
-                          {
-                            'name': 'gpu0',
-                            'deviceName': gpu_resource_name | default('nvidia.com/RTX_3090')
-                          }
-                        ]
-                      }
-                    }
-                  }
-                }
-              }
-            }, recursive=True)
-          }}
-      when: enable_gpu | default(false) | bool
-
-    - name: Prepare GPU romfile hook sidecar vars
-      # Builds the hookSidecars JSON annotation and the hostPath volume object
-      # so they can be combined into the VM definition in the next task.
-      # gpu_hook_image: override with -e gpu_hook_image=myregistry/gpu-romfile-hook:v1
-      # gpu_hook_rom:   override rom path inside the sidecar container
-      ansible.builtin.set_fact:
-        _hook_sidecars_json: >-
-          {{ [
-            {
-              'image': gpu_hook_image | default('localhost/gpu-romfile-hook:latest'),
-              'imagePullPolicy': 'Never',
-              'volumeMounts': [
-                {
-                  'name': 'gpu-rom',
-                  'mountPath': '/var/lib/kubevirt'
-                }
-              ]
-            }
-          ] | to_json }}
-        _gpu_rom_volume:
-          name: gpu-rom
-          hostPath:
-            path: /var/lib/kubevirt
-            type: Directory
-      when: enable_gpu | default(false) | bool
-
-    - name: Inject GPU romfile hook annotation and ROM hostPath volume into VM definition
-      # hooks.kubevirt.io/hookSidecars annotation triggers KubeVirt to run the sidecar
-      # alongside virt-launcher. The sidecar's OnDefineDomain gRPC call injects
-      #   <rom file='/var/lib/kubevirt/gpu-03-00-0-legacyrom.rom'/>
-      # into the GPU <hostdev> element before QEMU starts — equivalent to
-      #   -device vfio-pci,...,romfile=...
-      # The gpu-rom hostPath volume makes the ROM file accessible inside the sidecar.
-      ansible.builtin.set_fact:
-        vm_definition: >-
-          {{
-            vm_definition | combine({
-              'spec': {
-                'template': {
-                  'metadata': {
-                    'annotations': {
-                      'hooks.kubevirt.io/hookSidecars': _hook_sidecars_json
-                    }
-                  },
-                  'spec': {
-                    'volumes': vm_definition.spec.template.spec.volumes + [_gpu_rom_volume]
-                  }
-                }
-              }
-            }, recursive=True)
-          }}
-      when: enable_gpu | default(false) | bool
 
     - name: Create Windows 11 VirtualMachine
       kubernetes.core.k8s:
@@ -1118,7 +1001,7 @@
     - name: Display installation results
       ansible.builtin.debug:
         msg:
-          - "🎉 Windows 11 VM Installation Complete!"
+          - "🎉 Windows 11 VM Installation Complete (NO GPU)!"
           - ""
           - "📊 Status:"
           - "  VM Status: {{ deployed_vm.resources[0].status.printableStatus | default('Created') }}"
@@ -1132,10 +1015,7 @@
           - "  RDP:     kubectl port-forward svc/{{ vm_name }}-rdp 3389:3389 -n {{ kubevirt_namespace }}"
           - "           Then connect RDP client to localhost:3389"
           - ""
-          - "💡 Note: Windows 11 ISO-based install: boots from installer-iso CDROM, installs onto blank disk0."
+          - "💡 No GPU passthrough - standard VirtIO display adapter only."
           - "   First-boot setup takes 15-30 minutes (full ISO install + OOBE)."
           - "   VirtIO drivers install automatically via Autounattend + FirstLogonCommands."
           - "   TPM 2.0/SecureBoot requirements are bypassed via LabConfig registry keys."
-          - "   After install completes, remove or detach the installer ISO to prevent re-install on reboot."
-          - "{{ '   🎮 GPU passthrough: NVIDIA RTX 3090 (' ~ (gpu_resource_name | default(\"nvidia.com/RTX_3090\")) ~ \") attached as gpu0.\" if (enable_gpu | default(false) | bool) else \"\" }}"
-          - "{{ '   Install NVIDIA drivers inside Windows after first boot.' if (enable_gpu | default(false) | bool) else \"\" }}"

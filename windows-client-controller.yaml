@@ -56,8 +56,8 @@
 
     - name: Validate action parameter
       ansible.builtin.fail:
-        msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, status"
-      when: action not in ['install', 'uninstall', 'reinstall', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release']
+        msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, reinstall-nogpu, install-nogpu, status"
+      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release']
 
     - name: Display controller banner
       ansible.builtin.debug:
@@ -74,6 +74,11 @@
     - name: Execute Windows 11 installation
       ansible.builtin.include_tasks: windows-client/windows11-install.yaml
       when: action == 'install'
+
+    # Install (no GPU)
+    - name: Execute Windows 11 installation (no GPU)
+      ansible.builtin.include_tasks: windows-client/windows11-install-nogpu.yaml
+      when: action == 'install-nogpu'
 
     # Uninstall
     - name: Execute Windows 11 uninstallation
@@ -117,6 +122,18 @@
         - name: Install phase
           ansible.builtin.include_tasks: windows-client/windows11-install.yaml
       when: action == 'reinstall'
+
+    # Reinstall (no GPU)
+    - name: Execute Windows 11 reinstallation (no GPU)
+      block:
+        - name: Uninstall phase
+          ansible.builtin.include_tasks: windows-client/windows11-uninstall.yaml
+        - name: Pause between uninstall and install
+          ansible.builtin.wait_for:
+            timeout: 15
+        - name: Install phase (no GPU)
+          ansible.builtin.include_tasks: windows-client/windows11-install-nogpu.yaml
+      when: action == 'reinstall-nogpu'
 
     - name: Display completion message
       ansible.builtin.debug:

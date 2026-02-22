@@ -28,4 +28,14 @@ archive/
 *.tar.bz2
 *.7z
 *.tar.gz
+*.rom
+*.vmdk
+*.vdi
+*.vhd
+*.vhdx
+*.iso
+*.exe
+*.log
+__pycache__
+*.pyc
 

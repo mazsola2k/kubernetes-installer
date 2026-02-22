@@ -1,0 +1,99 @@
+---
+# Build and import the GPU romfile hook sidecar image into containerd
+#
+# Usage:
+#   source /opt/kubevirt-ansible-venv/bin/activate
+#   ansible-playbook windows-client/hooks/build-hook-image.yaml
+#
+# After this, the image is available as localhost/gpu-romfile-hook:latest
+# in the k8s.io containerd namespace (imagePullPolicy: Never).
+#
+- name: Build GPU romfile hook sidecar image
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    hook_dir: "{{ playbook_dir }}/gpu-romfile-hook"
+    image_name: "localhost/gpu-romfile-hook"
+    image_tag: "latest"
+    image_full: "{{ image_name }}:{{ image_tag }}"
+    # containerd namespace used by kubelet
+    ctr_namespace: "k8s.io"
+
+  tasks:
+    - name: Verify Dockerfile exists
+      ansible.builtin.stat:
+        path: "{{ hook_dir }}/Dockerfile"
+      register: dockerfile_stat
+      failed_when: not dockerfile_stat.stat.exists
+
+    - name: Copy ROM file into build context
+      # Bundle the 63 KB ROM into the image so no host volume mount is needed at runtime.
+      ansible.builtin.copy:
+        src: /var/lib/kubevirt/gpu-03-00-0-legacyrom.rom
+        dest: "{{ hook_dir }}/gpu-03-00-0-legacyrom.rom"
+        mode: '0644'
+        remote_src: true
+
+    - name: Copy ROM file into build context
+      # Bundle the 63 KB ROM file into the image so no host volume mount is needed at runtime.
+      ansible.builtin.copy:
+        src: /var/lib/kubevirt/gpu-03-00-0-legacyrom.rom
+        dest: "{{ hook_dir }}/gpu-03-00-0-legacyrom.rom"
+        mode: '0644'
+        remote_src: true
+
+    - name: Verify podman is available
+      ansible.builtin.command: which podman
+      register: podman_check
+      changed_when: false
+      failed_when: podman_check.rc != 0
+
+    - name: Build image with podman
+      ansible.builtin.command:
+        cmd: "podman build -t {{ image_full }} ."
+        chdir: "{{ hook_dir }}"
+      register: build_result
+      changed_when: true
+
+    - name: Display build output
+      ansible.builtin.debug:
+        msg: "{{ build_result.stdout_lines[-5:] }}"
+
+    - name: Save image to tarball
+      ansible.builtin.shell: |
+        podman save {{ image_full }} -o /tmp/gpu-romfile-hook.tar
+      register: save_result
+      changed_when: true
+
+    - name: Import image into containerd (k8s.io namespace)
+      ansible.builtin.shell: |
+        ctr -n {{ ctr_namespace }} images import /tmp/gpu-romfile-hook.tar
+      become: true
+      register: import_result
+      changed_when: true
+
+    - name: Clean up tarball
+      ansible.builtin.file:
+        path: /tmp/gpu-romfile-hook.tar
+        state: absent
+
+    - name: Verify image is visible in containerd
+      ansible.builtin.shell: |
+        ctr -n {{ ctr_namespace }} images ls | grep gpu-romfile-hook
+      become: true
+      register: verify_result
+      changed_when: false
+
+    - name: Display result
+      ansible.builtin.debug:
+        msg:
+          - "✅ Hook sidecar image built and imported successfully!"
+          - ""
+          - "Image in containerd:"
+          - "{{ verify_result.stdout }}"
+          - ""
+          - "Next step: reinstall the VM with GPU to activate the hook:"
+          - "  ansible-playbook windows-client-controller.yaml -e action=reinstall -e enable_gpu=true"
