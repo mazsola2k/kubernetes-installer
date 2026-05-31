@@ -622,6 +622,54 @@
       changed_when: true
       ignore_errors: true
 
+    # --- Sunshine/Moonlight streaming: reapply the full-path GSO/offload fix ---
+    # The VM was just (re)started, so KubeVirt built a fresh virt-launcher pod
+    # with a new netns + veth/tap/k6t interfaces — and offload state resets to ON.
+    # Without this, Sunshine video (UDP 47998) arrives on br-vm as
+    # "truncated-udplength 0" and Moonlight reports "no video received".
+    # This makes streaming survive every gpu-claim automatically (no separate
+    # network-install re-run needed). Best-effort: skips cleanly if br-vm absent.
+    - name: Wait for the virt-launcher pod to be Running, then fix offloads on the full VM→br-vm path
+      ansible.builtin.shell: |
+        set -e
+        OFF="gso off gro off tso off tx-udp-segmentation off rx-udp-gro-forwarding off"
+        VM="{{ vm_name | default('win11client') }}"
+        # br-vm may not exist if the bridge network was never set up — skip cleanly.
+        if ! ip link show br-vm &>/dev/null; then
+          echo "br-vm not present — run action=network-install first; skipping offload fix"
+          exit 0
+        fi
+        # Ensure host-side IP so the host can reach the VM on the bridge.
+        ip addr show br-vm | grep -q '{{ win_bridge_host_ip | default("192.168.100.1") }}/' || \
+          ip addr add {{ win_bridge_host_ip | default('192.168.100.1') }}/{{ win_bridge_prefix | default('24') }} dev br-vm || true
+        # host side: br-vm + its veth members
+        ethtool -K br-vm $OFF 2>/dev/null || true
+        for IF in $(ls /sys/class/net/br-vm/brif/ 2>/dev/null); do ethtool -K "$IF" $OFF 2>/dev/null || true; done
+        # wait (up to ~90s) for the virt-launcher pod + its netns to come up
+        NS=""
+        for i in $(seq 1 30); do
+          SANDBOX=$(crictl pods --name "virt-launcher-$VM" --state Ready -q 2>/dev/null | head -1)
+          [ -z "$SANDBOX" ] && SANDBOX=$(crictl pods --name "virt-launcher-$VM" -q 2>/dev/null | head -1)
+          if [ -n "$SANDBOX" ]; then
+            NETNS=$(crictl inspectp "$SANDBOX" 2>/dev/null | grep -oE '/var/run/netns/[a-z0-9-]+' | head -1)
+            [ -n "$NETNS" ] && { NS=$(basename "$NETNS"); break; }
+          fi
+          sleep 3
+        done
+        if [ -z "$NS" ]; then
+          echo "virt-launcher netns not ready yet — host-side offloads set; re-run action=network-install once the VM is up"
+          exit 0
+        fi
+        echo "pod netns: $NS"
+        for IF in $(ip netns exec "$NS" ls /sys/class/net 2>/dev/null | grep -E '^(tap|k6t-)|.*-nic$'); do
+          ip netns exec "$NS" ethtool -K "$IF" $OFF 2>/dev/null || true
+          echo "  offloads off: $IF"
+        done
+        echo "✅ full-path GSO/offload fix applied for streaming"
+      become: true
+      changed_when: false
+      ignore_errors: true
+
     - name: Claim summary
       ansible.builtin.debug:
         msg:
@@ -629,6 +677,7 @@
           - "   {{ claim_bind_result.stdout | default('already bound to vfio-pci') }}"
           - ""
           - "   Windows VM: {{ vm_name | default('win11client') }} — start requested"
+          - "   Streaming: full-path GSO/offload fix auto-applied (Sunshine video clean on br-vm)"
           - "   Connect:  virtctl vnc {{ vm_name | default('win11client') }} -n {{ kubevirt_namespace | default('default') }}"
           - ""
           - "   To release GPU back to Fedora/AI later:"

@@ -15,6 +15,7 @@
 #   ansible-playbook windows-client-controller.yaml -e action=network-install
 #   ansible-playbook windows-client-controller.yaml -e action=network-uninstall
 #   ansible-playbook windows-client-controller.yaml -e action=sunshine-install
+#   ansible-playbook windows-client-controller.yaml -e action=sunshine-fix
 #
 # Key variables (override with -e):
 #   win_bridge_host_ip   Host-side IP on br-vm bridge (default: 192.168.100.1)
@@ -42,6 +43,15 @@
 #   sunshine_version       Sunshine release tag (default: v2025.924.154138)
 #   sunshine_installer_url Direct download URL for Sunshine Windows installer
 #   sunshine_reinstall     Set to 'true' to force reinstall even if already installed (default: false)
+#   --- streaming breakfix (action=sunshine-fix), see windows-client/README.md ---
+#   sunshine_configure_capture  During sunshine-install, also run the capture
+#                          stack (VDD+primary+NVENC). Default true (turnkey).
+#                          Set false to install the Sunshine binary only.
+#   sunshine_install_vdd   Install the Virtual Display Driver (default: true)
+#   sunshine_vdd_gpu       GPU the VDD head composites on (default: 'NVIDIA GeForce RTX 3090')
+#   sunshine_stream_width  VDD head width  (default: 2560)
+#   sunshine_stream_height VDD head height (default: 1080)
+#   sunshine_reboot        Guest reboot to attach VDD head: auto|true|false (default: auto)
 #   windows 11 urls      https://www.windowscentral.com/microsoft/windows-11/microsofts-official-windows-11-version-25h2-rtm-iso-media-is-now-available-download-all-28-languages-here-for-x64-or-arm64
 
 - name: Windows Client Controller
@@ -74,7 +84,7 @@
     - name: Validate action parameter
       ansible.builtin.fail:
         msg: "Invalid action '{{ action }}'. Must be one of: install, uninstall, reinstall, reinstall-nogpu, install-nogpu, status"
-      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver', 'sunshine-install', 'network-install', 'network-uninstall']
+      when: action not in ['install', 'uninstall', 'reinstall', 'reinstall-nogpu', 'install-nogpu', 'status', 'gpu-setup', 'gpu-claim', 'gpu-release', 'nvidia-driver', 'sunshine-install', 'sunshine-fix', 'network-install', 'network-uninstall']
 
     - name: Display controller banner
       ansible.builtin.debug:
@@ -150,6 +160,16 @@
       ansible.builtin.include_tasks: windows-client/windows11-sunshine-install.yaml
       when: action == 'sunshine-install'
 
+    # Capture stack (VDD + primary display + NVENC + hardened service).
+    # Runs for both 'sunshine-install' (turnkey full pipeline) and 'sunshine-fix'
+    # (repair an existing install). Set sunshine_configure_capture=false to skip
+    # during sunshine-install (e.g. install the binary only).
+    - name: Execute Sunshine capture stack / breakfix
+      ansible.builtin.include_tasks: windows-client/windows11-sunshine-fix.yaml
+      when: >-
+        action == 'sunshine-fix' or
+        (action == 'sunshine-install' and (sunshine_configure_capture | default(true) | bool))
+
     # Reinstall (uninstall then install)
     - name: Execute Windows 11 reinstallation
       block:
@@ -189,6 +209,7 @@
           - "  GPU Rel:   ansible-playbook windows-client-controller.yaml -e action=gpu-release"
           - "  NVIDIA Drv: ansible-playbook windows-client-controller.yaml -e action=nvidia-driver"
           - "  Sunshine:   ansible-playbook windows-client-controller.yaml -e action=sunshine-install"
+          - "  SunshineFix:ansible-playbook windows-client-controller.yaml -e action=sunshine-fix"
           - ""
           - "Custom options:"
           - "  -e vm_name=mywin11          Custom VM name"

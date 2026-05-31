@@ -576,23 +576,27 @@ Once the GPU is passed through and the NVIDIA driver is installed, you can use *
 ### How It Works
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Kubernetes Host (Fedora Linux)                                   │
-│                                                                   │
-│  ┌────────────────────┐         ┌───────────────────────────┐   │
-│  │  Moonlight Client   │◄──UDP──►│  br-vm bridge             │   │
-│  │  (Flatpak/native)   │  47998  │  192.168.100.1/24         │   │
-│  │                     │  47999  │  offloads: GSO/GRO/TSO off│   │
-│  │                     │  48000  │                           │   │
-│  └────────────────────┘         └─────────┬─────────────────┘   │
-│                                            │ veth + tap          │
-│                                 ┌──────────▼────────────────┐   │
-│                                 │  KubeVirt Windows 11 VM    │   │
-│                                 │  192.168.100.10            │   │
-│                                 │  Sunshine Server            │   │
-│                                 │  RTX 3090 GPU (vfio-pci)   │   │
-│                                 └───────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Kubernetes Host (Fedora Linux)                                              │
+│                                                                              │
+│  ┌────────────────────┐        ┌─────────────────────────────────────────┐  │
+│  │  Moonlight Client   │◄─UDP──►│  br-vm bridge  192.168.100.1/24         │  │
+│  │  (Flatpak/native)   │ 47998  │  offloads OFF                           │  │
+│  │  video port 38xxx   │ video  └───────────────┬─────────────────────────┘  │
+│  └────────────────────┘                        │  GSO/offloads must be OFF   │
+│                                                 │  on EVERY hop:              │
+│                          veth(host) ─ veth(pod) ─ k6t-* bridge ─ tap          │
+│                                                 │ (all inside pod netns)      │
+│                                 ┌───────────────▼─────────────────────────┐  │
+│                                 │  KubeVirt Windows 11 VM  192.168.100.10  │  │
+│                                 │  SunshineService (LocalSystem)           │  │
+│                                 │    encoder=nvenc  →  hevc_nvenc          │  │
+│                                 │  Virtual Display Driver head = PRIMARY ───┼──┐
+│                                 │  RTX 3090 GPU (vfio-pci) renders the head │  ││
+│                                 └──────────────────────────────────────────┘  ││
+│                                   capture: DXGI Desktop Duplication of the ◄───┘│
+│                                   VDD head on the 3090 (NOT the QEMU display)   │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Sunshine Ports
@@ -614,7 +618,8 @@ The `windows-client-controller.yaml -e action=install` playbook:
 1. **Windows firewall rules** — Opens TCP 47984–48010 and UDP 47984–48010 inbound (`Sunshine TCP` / `Sunshine UDP` rules).
 2. **Kubernetes Service** — Creates `win11client-sunshine` ClusterIP service with `externalIPs` mapping all Sunshine ports to the host node IP.
 3. **Bridge network (`br-vm`)** — Creates a host bridge at `192.168.100.1/24` with a Multus `NetworkAttachmentDefinition` (`win-lan`), giving the VM a second NIC directly on the bridge.
-4. **Network offload fix** — Disables GSO/GRO/TSO/tx-udp-segmentation on `br-vm` (see below).
+4. **Network offload fix** — Disables GSO/GRO/TSO/tx-udp-segmentation along the **entire** VM→bridge path: `br-vm`, its veth members, and the `tap*`/`k6t-*`/`*-nic` interfaces inside the virt-launcher pod's netns (see below).
+5. **Streaming capture stack** — `action=sunshine-install` installs Sunshine; `action=sunshine-fix` configures the Virtual Display Driver, primary display, NVENC and the service (see [Virtual Display](#virtual-display--why-it-is-required-and-how-it-is-configured)).
 
 ### Critical: Bridge Network Offload Fix
 
@@ -626,24 +631,48 @@ The `windows-client-controller.yaml -e action=install` playbook:
 
 Audio (port 47999) and control (port 48000) work fine because they use small packets that don't trigger GSO aggregation. Only video (port 47998) is affected because encoded video frames are large enough for the kernel to apply GSO.
 
-**Fix (applied automatically by the playbook):**
+**The path matters — `br-vm` alone is NOT enough.** Traffic flows
+`VM → tap → k6t-* bridge → veth (pod) → veth (host) → br-vm → host`. GSO super-frames pass
+through *any* hop whose offloads are on, so the truncation reappears even with `br-vm` clean.
+All hops must have offloads disabled.
+
+**Fix (applied automatically by `action=network-install`):**
 
 ```bash
-ethtool -K br-vm gso off gro off tso off tx-udp-segmentation off
+OFF="gso off gro off tso off tx-udp-segmentation off rx-udp-gro-forwarding off"
+# host side
+ethtool -K br-vm $OFF
+for IF in $(ls /sys/class/net/br-vm/brif/); do ethtool -K "$IF" $OFF; done
+# inside the virt-launcher pod netns (names are dynamic — discovered by the playbook)
+NS=$(basename $(crictl inspectp $(crictl pods --name virt-launcher-win11client -q | head -1) \
+      | grep -oE '/var/run/netns/[a-z0-9-]+' | head -1))
+for IF in $(ip netns exec "$NS" ls /sys/class/net | grep -E '^(tap|k6t-)|.*-nic$'); do
+  ip netns exec "$NS" ethtool -K "$IF" $OFF
+done
 ```
 
-This is run in `windows-network-install.yaml` every time the bridge is created or already exists — it's idempotent. The offload settings are per-interface kernel state, so they reset whenever the bridge is recreated (reboot, `ip link delete`). The playbook applies them each run.
+The playbook discovers the (dynamic) veth/tap/k6t/netns names automatically. Offload state is
+per-interface kernel state and **resets whenever the VM/pod restarts** (a new netns + veths are
+created).
+
+**This is now reapplied automatically by the GPU pipeline.** `action=gpu-claim`
+([`windows11-gpu-setup.yaml`](windows11-gpu-setup.yaml)) starts the VM with the passed-through
+GPU and then waits for the new virt-launcher pod netns and reapplies the full-path offload fix
+(and the `br-vm` host IP). Since `gpu-claim` is what brings the VM up after a release/reboot,
+streaming survives restarts with no manual step. Running `action=network-install` separately is
+still supported (e.g. when the VM was started by other means).
 
 ### Manual Verification
 
-If streaming stops working after a host reboot (before re-running the playbook), verify and fix offloads manually:
+If streaming stops working after a VM or host restart (before re-running the playbook), verify
+the whole path and re-run the fix:
 
 ```bash
-# Check current offload state
+# Check br-vm + its veths
 ethtool -k br-vm | grep -E 'generic-segmentation|generic-receive|tx-udp-seg'
 
-# If any show "on", disable them
-sudo ethtool -K br-vm gso off gro off tso off tx-udp-segmentation off
+# Quickest fix: just re-run the playbook (handles the full path incl. pod netns)
+ansible-playbook windows-client-controller.yaml -e action=network-install
 ```
 
 To verify video packets are not truncated during a Moonlight session:
@@ -655,12 +684,144 @@ sudo tcpdump -i br-vm -n 'udp port 47998' -c 10
 
 ### Connecting with Moonlight
 
-1. **Install Sunshine** on the Windows VM — download from [GitHub releases](https://github.com/LizardByte/Sunshine/releases) and install.
-2. **Configure Sunshine** — open `https://192.168.100.10:47990` from the host browser, set a username/password.
-3. **Install Moonlight** on the client — Flatpak (`com.moonlight_stream.Moonlight`), native package, or on another device.
-4. **Add host** in Moonlight — use `192.168.100.10` (bridge IP) or the Kubernetes node IP if using the externalIPs service.
-5. **Pair** — enter the PIN shown in Moonlight into the Sunshine web UI.
-6. **Stream** — select a desktop or application.
+Full end-to-end order (from a clean VM):
+
+```bash
+# 1. Bridge + Multus NAD must exist BEFORE the VM is (re)created so it gets eth1
+ansible-playbook windows-client-controller.yaml -e action=network-install
+# 2. (Re)create the VM so it picks up the br-vm NIC, then install the GPU driver
+#    ... action=reinstall / nvidia-driver as needed ...
+# 3. Turnkey streaming: installs Sunshine AND configures the capture stack
+#    (VDD + primary display + NVENC + hardened LocalSystem service)
+ansible-playbook windows-client-controller.yaml -e action=sunshine-install
+# 4. Re-run the offload fix now the VM is up (disables GSO on the full veth/tap/k6t path)
+ansible-playbook windows-client-controller.yaml -e action=network-install
+```
+
+> **Why `network-install` appears twice:** the bridge + `win-lan` NAD must exist *before* the
+> VM is created (so the VM gets its `eth1`), but the GSO/offload fix on the `tap*`/`k6t-*`/veth
+> hops can only be applied *after* the VM (and its pod netns) is running. Re-running it is
+> idempotent and is also how you reapply the offload fix after any VM/pod restart.
+>
+> `action=sunshine-install` now runs the capture stack automatically
+> ([`windows11-sunshine-fix.yaml`](windows11-sunshine-fix.yaml)). Use `action=sunshine-fix` to
+> re-run just the capture/service repair, or `-e sunshine_configure_capture=false` to install
+> the Sunshine binary only.
+
+Then on the client:
+
+1. **Configure Sunshine** — open `https://192.168.100.10:47990` from the host browser, set a username/password.
+2. **Install Moonlight** — Flatpak (`flatpak run com.moonlight_stream.Moonlight`), native, or another device.
+3. **Add host** — use **`192.168.100.10`** directly (the bridge IP). Avoid the node IP / `externalIPs` service so kube-proxy/iptables stay out of the media path.
+4. **Pair** — enter the PIN shown in Moonlight into the Sunshine web UI (PIN tab).
+5. **Stream** → **Desktop**. You should get the VDD head (e.g. 1920×1080 / 2560×1080) encoded with NVENC, holding past the old ~11s drop.
+
+> The host can reach `192.168.100.10` only while `br-vm` has its host IP (`192.168.100.1/24`) —
+> `action=network-install` assigns it. `virtctl vnc` shows only the emulated QEMU display, never
+> the streamed VDD/3090 head (expected).
+
+### Virtual Display — why it is required, and how it is configured
+
+A passed-through **GeForce RTX 3090 has no NvFBC** (NVIDIA restricts NvFBC desktop capture to
+Quadro/datacenter cards), so Sunshine uses the Windows **Desktop Duplication API (DXGI)**, which
+can only capture a display that has a **live, composited desktop driven by a GPU**. But a
+passthrough GPU in a KubeVirt VM has **no monitor/EDID**, so Windows composites the desktop on
+the emulated **QEMU display via the Microsoft Basic Render Driver (WARP, software)** — Sunshine
+captures *that* (1280×800, software `libx264`), not the 3090.
+
+The fix is a **Virtual Display Driver (VDD)** — an Indirect Display Driver that presents a real
+virtual monitor **bound to the RTX 3090**. With that head set as the **primary display**,
+Sunshine's default capture grabs the 3090 output and encodes with **NVENC (`hevc_nvenc`)**.
+
+Verified working configuration on `win11client`:
+
+| Component | Value |
+|-----------|-------|
+| VDD | [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) **signed** `25.5.2` x64 setup (loads without test-signing; SecureBoot is off) |
+| `C:\VirtualDisplayDriver\vdd_settings.xml` | `<gpu><friendlyname>NVIDIA GeForce RTX 3090</friendlyname></gpu>`, resolutions incl. the stream res |
+| Primary display | the VDD head (`MTT1337`), set with **NirSoft MultiMonitorTool** `/SetPrimary` (run in the interactive session via a scheduled task — a session-0 service cannot change session-1 layout) |
+| `C:\Program Files\Sunshine\config\sunshine.conf` | `encoder = nvenc` · `dd_configuration_option = disabled` · `nvenc_preset = 1` |
+| `SunshineService` | `LocalSystem`, **Automatic (Delayed)**, auto-restart recovery |
+| Autologon | `AutoAdminLogon=1`, no `LogonCount` cap (console keeps a live desktop) |
+
+> Why `dd_configuration_option = disabled` and **not** `output_name`/`ensure_primary`:
+> pinning Sunshine to a specific `\\.\DISPLAYn` is unreliable because GDI display numbers
+> **renumber** when the topology changes at stream start, producing `Failed to locate an
+> output device`. Setting the VDD head primary *up front* and letting Sunshine use its default
+> capture is stable.
+
+### Troubleshooting: "No video received" after ~11 seconds
+
+Moonlight **connects** (TCP/RTSP OK, Sunshine logs `CLIENT CONNECTED`) then drops after ~11s with
+*"no video received — check UDP 47998/48000."* On this stack there were **three independent
+faults**, all confirmed live with packet captures and `sunshine.log`. Work through them in order:
+
+**1. Service** — `SunshineService` must be **Running / Automatic / LocalSystem**. A named
+account (e.g. `.\Administrator`) or a Disabled service cannot capture the interactive console.
+```powershell
+Get-CimInstance Win32_Service -Filter "Name='SunshineService'" | ft State,StartMode,StartName
+```
+
+**2. Capture / encoder** — read `C:\Program Files\Sunshine\config\sunshine.log` during a stream:
+```
+Microsoft Basic Render Driver … 1280x800 … Creating encoder [libx264]   ← WRONG (WARP/software)
+NVIDIA GeForce RTX 3090 … 1920x1080 … Creating encoder [hevc_nvenc]      ← CORRECT (VDD on 3090)
+```
+If you see the WARP/`libx264` case, the **VDD head is not primary** (or not installed). See
+[Virtual Display](#virtual-display--why-it-is-required-and-how-it-is-configured) above. You can
+confirm the topology with Sunshine's bundled probe, run in the interactive session:
+`C:\Program Files\Sunshine\tools\dxgi-info.exe` — the 3090 should list an attached `OUTPUT`.
+
+**3. Network (the GSO truncation — the original symptom)** — once NVENC is encoding, the VM
+sends video on **UDP 47998**, but the packets can still arrive on `br-vm` as
+**`truncated-udplength 0`** and Moonlight drops them. This is GSO segmentation, and **disabling
+offloads on `br-vm` alone is not enough** — the truncation happens on the `veth`/`tap`/`k6t`
+hops between the VM and `br-vm`. Offloads must be off on the **entire path**:
+
+```bash
+# Proof: capture inside the VM (pktmon) vs on br-vm. If the VM sends 47998 packets
+# but br-vm shows them all "truncated", this is the bug.
+sudo tcpdump -ni br-vm 'udp port 47998' -c 20      # want "UDP, length ~1100", NOT truncated
+```
+
+This is fixed automatically by **`action=network-install`**, which now disables offloads on
+`br-vm`, every veth member, and the `tap*` / `k6t-*` / `*-nic` interfaces inside the
+virt-launcher pod's netns (see [the offload fix below](#critical-bridge-network-offload-fix)).
+Offload state resets when the VM/pod restarts — **re-run `network-install` after (re)starting the VM.**
+
+#### The two playbooks that fix it
+
+```bash
+# 1) Guest side: service + VDD + primary display + NVENC config (+ optional guest reboot)
+ansible-playbook windows-client-controller.yaml -e action=sunshine-fix
+
+# 2) Host side: full-path GSO/offload fix + br-vm host IP  (re-run after each VM restart)
+ansible-playbook windows-client-controller.yaml -e action=network-install
+```
+
+[`windows11-sunshine-fix.yaml`](windows11-sunshine-fix.yaml) (idempotent) does, over WinRM:
+
+| Phase | What it does |
+|-------|--------------|
+| **Service** | Restores `SunshineService` to **LocalSystem**, **Automatic (Delayed)**, with auto-restart recovery. |
+| **Autologon** | Makes autologon persistent (removes the `LogonCount` cap) so the console keeps a live desktop; stops disconnected RDP sessions from locking it. |
+| **Capture surface** | Installs the signed **Virtual Display Driver**, writes `vdd_settings.xml` (GPU = RTX 3090 + resolution), reboots the guest if newly installed so the head attaches, then **sets the VDD head as the primary display** (MultiMonitorTool). |
+| **Encoder** | Writes the verified `sunshine.conf` (`encoder=nvenc`, `dd_configuration_option=disabled`). |
+| **Verify** | Reports ports, active session, display adapters/monitors, and the `sunshine.log` tail. |
+
+Useful overrides:
+```bash
+-e sunshine_install_vdd=false                         # using a physical dummy HDMI/DP plug instead
+-e sunshine_reboot=false                              # auto (default) | true | false
+-e sunshine_stream_width=2560 -e sunshine_stream_height=1080
+-e sunshine_vdd_gpu="NVIDIA GeForce RTX 3090"         # GPU the VDD head composites on
+```
+
+> **Note on the VDD:** it is an IDD driver; the head attaches on reboot. The signed `25.5.2`
+> build loads without test-signing (this VM has SecureBoot off). If no virtual head appears,
+> enable test-signing (`bcdedit /set testsigning on`) or use a physical dummy plug with
+> `-e sunshine_install_vdd=false`. VNC (`virtctl vnc`) only shows the emulated QEMU display, never
+> the VDD/3090 head — that is expected, and not a fault.
 
 ---
 

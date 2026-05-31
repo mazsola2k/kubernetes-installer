@@ -1,0 +1,516 @@
+# Sunshine Streaming Server — Breakfix + Hardened Service Startup
+# ===============================================================
+# Repairs a broken Sunshine streaming setup on the Windows 11 KubeVirt VM and
+# hardens it so it survives reboots and never falls back to capturing the wrong
+# display.
+#
+# Called by windows-client-controller.yaml — do not run directly.
+#   ansible-playbook windows-client-controller.yaml -e action=sunshine-fix
+#
+# Root causes this playbook addresses (all confirmed live on win11client)
+# -----------------------------------------------------------------------
+# Moonlight connects (TCP/RTSP OK, "CLIENT CONNECTED" in Sunshine) but drops
+# after ~11s with "no video received". There were THREE independent faults,
+# all of which must be fixed:
+#
+#   1. SERVICE  — SunshineService was Disabled/Stopped (and at one point set to
+#      a named account). It must run as LocalSystem so it can capture the
+#      interactive console desktop. (Phase 1)
+#
+#   2. CAPTURE  — The RTX 3090 is a GeForce card (no NvFBC) with no monitor/EDID
+#      in the passthrough VM, so Windows composited the desktop on the Microsoft
+#      Basic Render Driver (WARP, software) at 1280x800 — Sunshine captured THAT
+#      and fell back to software libx264. The fix is a Virtual Display Driver
+#      head bound to the RTX 3090, set as the PRIMARY display, so Sunshine's
+#      default capture grabs the 3090 output and uses NVENC. (Phases 2-3)
+#      Note: pinning Sunshine to output_name=\\.\DISPLAY6 was unreliable — the
+#      GDI display number renumbers at stream start ("Failed to locate an output
+#      device"). Making the VDD head primary + default capture is stable.
+#
+#   3. NETWORK  — Once NVENC frames flowed, every video packet (UDP 47998) still
+#      arrived on br-vm as "truncated-udplength 0" (GSO segmentation). Disabling
+#      offloads on br-vm ALONE is not enough: the truncation happens on the
+#      veth/tap/k6t hops between the VM and br-vm. Offloads must be disabled on
+#      the WHOLE path. That part lives in windows-network-install.yaml
+#      (action=network-install) — run it after this playbook.
+#
+# This playbook is idempotent and safe to re-run.
+#
+# Key variables (all optional, inherit from controller):
+#   vm_name                 VM name (default: win11client)
+#   kubevirt_namespace      Namespace (default: default)
+#   windows_admin_password  Administrator password (default: SecureP@ssw0rd!)
+#   sunshine_install_vdd    Install the Virtual Display Driver (default: true)
+#   sunshine_stream_width   Virtual display width  (default: 2560)
+#   sunshine_stream_height  Virtual display height (default: 1080)
+#   sunshine_reboot         auto | true | false — graceful in-guest reboot so a
+#                           freshly installed virtual display head attaches.
+#                           'auto' (default) reboots only if the VDD was just
+#                           installed; 'true' always; 'false' never.
+
+- name: Set Sunshine fix defaults
+  ansible.builtin.set_fact:
+    kubevirt_namespace: "{{ kubevirt_namespace | default('default') }}"
+    vm_name: "{{ vm_name | default('win11client') }}"
+    windows_admin_password: "{{ windows_admin_password | default('SecureP@ssw0rd!') }}"
+    sunshine_install_vdd: "{{ sunshine_install_vdd | default('true') }}"
+    sunshine_reboot: "{{ sunshine_reboot | default('auto') }}"
+    sunshine_stream_width: "{{ sunshine_stream_width | default('2560') }}"
+    sunshine_stream_height: "{{ sunshine_stream_height | default('1080') }}"
+    # Signed x64 setup — loads without test-signing (verified live on win11client).
+    sunshine_vdd_url: >-
+      {{ sunshine_vdd_url | default(
+        'https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.5.2/Virtual.Display.Driver-v25.05.03-setup-x64.exe'
+      ) }}
+    # GPU the virtual display head composites on (so NVENC reads it directly).
+    sunshine_vdd_gpu: "{{ sunshine_vdd_gpu | default('NVIDIA GeForce RTX 3090') }}"
+  tags: always
+
+# -----------------------------------------------------------------------
+# WinRM connectivity — HTTP (port 5985, basic/unencrypted)
+# -----------------------------------------------------------------------
+- name: Kill any stale WinRM port-forwards
+  ansible.builtin.shell: |
+    pkill -f "kubectl.*port-forward.*win11client-winrm" 2>/dev/null || true
+    sleep 1
+  ignore_errors: true
+
+- name: Start WinRM HTTP port-forward via library script (setsid — survives task exit)
+  ansible.builtin.shell: |
+    bash "{{ playbook_dir }}/library/start_portforward.sh" \
+      "{{ vm_name }}-winrm" \
+      5985 \
+      "{{ kubevirt_namespace }}" \
+      /tmp/winrm-pf.log \
+      /tmp/winrm-pf.pid
+    sleep 4
+  ignore_errors: true
+
+- name: Wait for WinRM HTTP to actually respond (not just TCP)
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:5985/wsman 2>/dev/null)
+      [ "$code" != "000" ] && exit 0
+      sleep 2
+    done
+    echo "WinRM did not respond after 60s" >&2
+    exit 1
+
+- name: Set WinRM HTTP connection vars
+  ansible.builtin.set_fact:
+    _winrm: &winrm_vars
+      ansible_connection: winrm
+      ansible_user: Administrator
+      ansible_password: "{{ windows_admin_password }}"
+      ansible_host: localhost
+      ansible_winrm_transport: basic
+      ansible_winrm_server_cert_validation: ignore
+      ansible_winrm_port: 5985
+      ansible_winrm_scheme: http
+  no_log: true
+
+- name: Confirm WinRM connectivity — get hostname
+  ansible.windows.win_command:
+    cmd: hostname
+  register: win_hostname
+  become: false
+  vars: *winrm_vars
+
+- name: Display connected VM hostname
+  ansible.builtin.debug:
+    msg: "✅ Connected to Windows VM: {{ win_hostname.stdout | trim }}"
+
+# =======================================================================
+# PHASE 1 — BREAKFIX: restore SunshineService to a working state
+# =======================================================================
+
+- name: "[fix] Locate the Sunshine service and its binary"
+  ansible.windows.win_shell: |
+    $svc = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
+    if (-not $svc) {
+      $svc = Get-Service | Where-Object { $_.DisplayName -match 'Sunshine' } | Select-Object -First 1
+    }
+    if (-not $svc) {
+      Write-Host "SUNSHINE_SVC=none"
+      exit 0
+    }
+    $name = $svc.Name
+    $wmi  = Get-CimInstance Win32_Service -Filter "Name='$name'"
+    Write-Host "SUNSHINE_SVC=$name"
+    Write-Host "CURRENT_ACCOUNT=$($wmi.StartName)"
+    Write-Host "CURRENT_STATE=$($svc.Status)"
+    Write-Host "BINPATH=$($wmi.PathName)"
+  register: svc_info
+  become: false
+  vars: *winrm_vars
+
+- name: "[fix] Show current service state"
+  ansible.builtin.debug:
+    msg: "{{ svc_info.stdout_lines | default(['No output']) }}"
+
+- name: "[fix] Fail early if no Sunshine service is installed"
+  ansible.builtin.fail:
+    msg: "No Sunshine service found on {{ vm_name }}. Run 'action=sunshine-install' first."
+  when: "'SUNSHINE_SVC=none' in (svc_info.stdout | default(''))"
+
+- name: "[fix] Restore SunshineService to LocalSystem + harden startup"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $name = (('{{ svc_info.stdout }}' -split "`n" |
+              Where-Object { $_ -match '^SUNSHINE_SVC=' }) -replace '^SUNSHINE_SVC=','').Trim()
+    if (-not $name) { $name = 'SunshineService' }
+
+    # Stop it before reconfiguring so the new logon account takes effect cleanly.
+    Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+
+    # --- Breakfix: capture of the interactive desktop REQUIRES LocalSystem ---
+    # (debugging had changed this to .\Administrator, which cannot reach the
+    #  console session and often fails to start at all)
+    & sc.exe config $name obj= LocalSystem type= own | Out-Null
+    Write-Host "Set $name logon account -> LocalSystem"
+
+    # --- Enhanced startup ---
+    # Delayed auto-start: lets the console session / GPU display come up first.
+    & sc.exe config $name start= delayed-auto | Out-Null
+    Write-Host "Set $name start type -> Automatic (Delayed Start)"
+
+    # Crash/timeout recovery: always try to bring the streamer back.
+    & sc.exe failure $name reset= 86400 actions= restart/5000/restart/5000/restart/15000 | Out-Null
+    & sc.exe failureflag $name 1 | Out-Null
+    Write-Host "Set $name recovery -> restart (5s, 5s, 15s)"
+
+    # SYSTEM must be allowed to interact with the session for DXGI capture.
+    Start-Service -Name $name
+    Start-Sleep -Seconds 3
+    $svc = Get-Service -Name $name
+    Write-Host "STATE_AFTER=$($svc.Status)"
+    $wmi = Get-CimInstance Win32_Service -Filter "Name='$name'"
+    Write-Host "ACCOUNT_AFTER=$($wmi.StartName)"
+  register: svc_fix
+  become: false
+  vars: *winrm_vars
+
+- name: "[fix] Show post-fix service state"
+  ansible.builtin.debug:
+    msg: "{{ svc_fix.stdout_lines | default(['No output']) }}"
+
+# =======================================================================
+# PHASE 2 — ENHANCE: ensure a live console session exists to capture
+# =======================================================================
+
+- name: "[fix] Make autologon persistent (keeps a composited desktop on the console)"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Set-ItemProperty $key -Name AutoAdminLogon    -Value '1'              -Type String
+    Set-ItemProperty $key -Name DefaultUserName   -Value 'Administrator'  -Type String
+    Set-ItemProperty $key -Name DefaultDomainName -Value '.'              -Type String
+    Set-ItemProperty $key -Name DefaultPassword   -Value '{{ windows_admin_password }}' -Type String
+    # Remove the LogonCount cap so autologon does not expire after a few boots.
+    Remove-ItemProperty $key -Name AutoLogonCount -ErrorAction SilentlyContinue
+    # Do not lock the console when an RDP session disconnects (keeps DWM alive).
+    $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+    if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
+    Set-ItemProperty $ts -Name fDisconnectedSessionLimit -ErrorAction SilentlyContinue -Value 0
+    Write-Host "✅ Persistent autologon configured for .\Administrator"
+  become: false
+  vars: *winrm_vars
+  no_log: true
+
+# -----------------------------------------------------------------------
+# Virtual Display Driver — gives the headless RTX 3090 a real desktop surface
+# at the streaming resolution so Sunshine never captures the 1024x768 RDP head.
+# -----------------------------------------------------------------------
+- name: "[fix] Check whether a virtual display driver is already present"
+  ansible.windows.win_shell: |
+    $vdd = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+           Where-Object { $_.FriendlyName -match 'Virtual Display|IddSample|MttVDD|Idd' }
+    if ($vdd) { Write-Host "VDD_PRESENT=true"; $vdd.FriendlyName | ForEach-Object { Write-Host "  $_" } }
+    else      { Write-Host "VDD_PRESENT=false" }
+  register: vdd_check
+  become: false
+  vars: *winrm_vars
+
+- name: "[fix] Download + install Virtual Display Driver (signed Inno setup)"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    New-Item -ItemType Directory -Force -Path C:\Data\temp | Out-Null
+    $dest = 'C:\Data\temp\vdd-setup.exe'
+    Write-Host "Downloading Virtual Display Driver from {{ sunshine_vdd_url }}"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    (New-Object System.Net.WebClient).DownloadFile('{{ sunshine_vdd_url }}', $dest)
+    Write-Host "Installing (silent)..."
+    # Signed build ships an Inno Setup installer — /VERYSILENT, not NSIS /S.
+    $p = Start-Process -FilePath $dest `
+      -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait -PassThru
+    Write-Host "Installer exit code: $($p.ExitCode)"
+    Start-Sleep -Seconds 6
+    $vdd = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+           Where-Object { $_.FriendlyName -match 'Virtual Display|IddSample|MttVDD|Idd' }
+    if ($vdd) { Write-Host "✅ Virtual display driver installed: $($vdd.FriendlyName)" }
+    else      { Write-Host "⚠️  Driver installed but no virtual display device detected yet" }
+  register: vdd_install
+  become: false
+  vars: *winrm_vars
+  async: 600
+  poll: 15
+  ignore_errors: true
+  when:
+    - sunshine_install_vdd | bool
+    - "'VDD_PRESENT=false' in (vdd_check.stdout | default(''))"
+
+- name: "[fix] Configure VDD resolution + GPU and (re)attach the head"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $xmlPath = 'C:\VirtualDisplayDriver\vdd_settings.xml'
+    if (-not (Test-Path $xmlPath)) {
+      Write-Host "vdd_settings.xml not found at $xmlPath — skipping (driver layout differs)"
+      exit 0
+    }
+    $w = '{{ sunshine_stream_width }}'; $h = '{{ sunshine_stream_height }}'
+    $gpu = '{{ sunshine_vdd_gpu }}'
+    $xml = @(
+      "<?xml version='1.0' encoding='utf-8'?>",
+      "<vdd_settings>",
+      "  <monitors><count>1</count></monitors>",
+      "  <gpu><friendlyname>$gpu</friendlyname></gpu>",
+      "  <global><g_refresh_rate>60</g_refresh_rate><g_refresh_rate>120</g_refresh_rate></global>",
+      "  <resolutions>",
+      "    <resolution><width>$w</width><height>$h</height><refresh_rate>60</refresh_rate></resolution>",
+      "    <resolution><width>1920</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>",
+      "  </resolutions>",
+      "  <options>",
+      "    <CustomEdid>false</CustomEdid><PreventSpoof>false</PreventSpoof>",
+      "    <EdidCeaOverride>false</EdidCeaOverride><HardwareCursor>true</HardwareCursor>",
+      "    <SDR10bit>false</SDR10bit><HDRPlus>false</HDRPlus>",
+      "    <logging>false</logging><debuglogging>false</debuglogging>",
+      "  </options>",
+      "</vdd_settings>"
+    )
+    Set-Content -Path $xmlPath -Value $xml -Encoding UTF8
+    Write-Host "Wrote $xmlPath (GPU={{ sunshine_vdd_gpu }}, ${w}x${h}@60)"
+    # Bounce the device so it picks up the new settings and attaches the head.
+    $d = Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'Virtual Display|MttVDD' } | Select-Object -First 1
+    if ($d) {
+      Disable-PnpDevice -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+      Start-Sleep 3
+      Enable-PnpDevice  -InstanceId $d.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+      Start-Sleep 4
+    }
+    $m = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue |
+         Where-Object { $_.InstanceName -match 'MTT' -and $_.Active }
+    if ($m) { Write-Host "✅ VDD head active: $($m.InstanceName)" }
+    else    { Write-Host "⚠️  VDD head not yet active — a guest reboot will attach it" }
+  register: vdd_config
+  become: false
+  vars: *winrm_vars
+  ignore_errors: true
+  when: sunshine_install_vdd | bool
+
+- name: "[fix] Show virtual display driver result"
+  ansible.builtin.debug:
+    msg: "{{ vdd_install.stdout_lines | default(vdd_check.stdout_lines) | default(['skipped']) }}"
+
+- name: "[fix] Record whether the virtual display driver was freshly installed"
+  ansible.builtin.set_fact:
+    vdd_freshly_installed: "{{ (vdd_install is defined) and (vdd_install.changed | default(false)) and not (vdd_install.failed | default(false)) }}"
+
+# -----------------------------------------------------------------------
+# Graceful in-guest reboot so a freshly installed IDD virtual display head
+# attaches. Reboots the GUEST OS only — the VMI (and GPU passthrough) stays
+# up, so the WinRM port-forward survives and reconnects automatically.
+# -----------------------------------------------------------------------
+- name: "[fix] Reboot Windows guest so the virtual display head attaches"
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+    post_reboot_delay: 25
+    test_command: "powershell.exe -NoProfile -Command \"exit 0\""
+  become: false
+  vars: *winrm_vars
+  when: >-
+    sunshine_reboot | lower == 'true' or
+    (sunshine_reboot | lower == 'auto' and (vdd_freshly_installed | bool))
+
+# -----------------------------------------------------------------------
+# Make the VDD head the PRIMARY display — and keep it primary across reboots.
+# This is the key capture step: with the VDD primary, Sunshine's default capture
+# grabs the RTX 3090 output (NVENC). If the WARP/QEMU display stays primary,
+# Sunshine captures it in software (libx264) at the wrong resolution.
+#
+# Windows does NOT reliably persist the primary-display choice across reboots
+# (it often reverts to the QEMU display), so we also register a PERMANENT logon
+# scheduled task that re-asserts VDD-primary on every boot. This is the
+# Windows-side self-heal that matches the host-side offload self-heal in
+# windows11-gpu-setup.yaml (gpu-claim). MultiMonitorTool is installed to a stable
+# path and the task runs in the interactive console session (session 1) — a
+# session-0 service cannot change session-1 display layout.
+# -----------------------------------------------------------------------
+- name: "[fix] Set VDD head primary now + install a persistent logon task to keep it primary"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    # Stable install location (survives temp cleanup / reboots).
+    $dir = 'C:\Tools\mmt'
+    if (-not (Test-Path "$dir\MultiMonitorTool.exe")) {
+      New-Item -ItemType Directory -Force -Path $dir | Out-Null
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      $zip = "$dir\mmt.zip"
+      (New-Object System.Net.WebClient).DownloadFile(
+        'https://www.nirsoft.net/utils/multimonitortool-x64.zip', $zip)
+      Expand-Archive -Path $zip -DestinationPath $dir -Force
+    }
+    $exe = "$dir\MultiMonitorTool.exe"
+
+    # 1) Apply now, in the interactive session (one-shot helper task).
+    $a = New-ScheduledTaskAction -Execute $exe -Argument '/SetPrimary "MTT1337"'
+    $p = New-ScheduledTaskPrincipal -UserId 'Administrator' -LogonType Interactive -RunLevel Highest
+    Register-ScheduledTask -TaskName 'vddprimary-now' -Action $a -Principal $p -Force | Out-Null
+    Start-ScheduledTask -TaskName 'vddprimary-now'
+    Start-Sleep 4
+    Unregister-ScheduledTask -TaskName 'vddprimary-now' -Confirm:$false -ErrorAction SilentlyContinue
+
+    # 2) Persist: a logon task that re-asserts VDD-primary on every boot/logon.
+    #    Small delay lets the VDD head attach before we set it primary.
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'Administrator'
+    $trigger.Delay = 'PT15S'
+    $action  = New-ScheduledTaskAction -Execute $exe -Argument '/SetPrimary "MTT1337"'
+    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName 'VddSetPrimary' -Trigger $trigger -Action $action `
+      -Principal $p -Settings $set -Force `
+      -Description 'Re-assert the Virtual Display Driver head as the primary display for Sunshine capture' | Out-Null
+    Write-Host "Set VDD (MTT1337) primary + registered logon task 'VddSetPrimary' for persistence"
+  register: vdd_primary
+  become: false
+  vars: *winrm_vars
+  ignore_errors: true
+  when: sunshine_install_vdd | bool
+
+# =======================================================================
+# PHASE 3 — pin Sunshine to NVENC, then restart
+# =======================================================================
+
+- name: "[fix] Write a known-good sunshine.conf (force NVENC)"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    # This Sunshine build keeps its config next to the binary, not the system
+    # profile (verified live). Prefer that; fall back to the profile path.
+    $candidates = @(
+      "$env:ProgramFiles\Sunshine\config\sunshine.conf",
+      "$env:WINDIR\System32\config\systemprofile\AppData\Roaming\Sunshine\sunshine.conf"
+    )
+    $conf = $candidates | Where-Object { Test-Path (Split-Path $_ -Parent) } | Select-Object -First 1
+    if (-not $conf) {
+      $conf = $candidates[0]
+      New-Item -ItemType Directory -Force -Path (Split-Path $conf -Parent) | Out-Null
+    }
+    if (Test-Path $conf) { Copy-Item $conf "$conf.bak" -Force -ErrorAction SilentlyContinue }
+
+    # Verified-working config on win11client:
+    #   - encoder=nvenc                      use the RTX 3090 NVENC engine
+    #   - dd_configuration_option=disabled   do NOT let Sunshine reconfigure the
+    #     display at stream start; the VDD head is already primary (set above).
+    #     (ensure_primary / output_name pinning caused "Failed to locate an
+    #      output device" because GDI display numbers renumber mid-stream.)
+    $lines = @(
+      'encoder = nvenc',
+      'dd_configuration_option = disabled',
+      'nvenc_preset = 1',
+      'min_log_level = info'
+    )
+    Set-Content -Path $conf -Value $lines -Encoding ascii
+    Write-Host "Wrote $conf"
+    Get-Content $conf | ForEach-Object { Write-Host "  $_" }
+  register: conf_write
+  become: false
+  vars: *winrm_vars
+
+- name: "[fix] Show sunshine.conf"
+  ansible.builtin.debug:
+    msg: "{{ conf_write.stdout_lines | default(['No output']) }}"
+
+- name: "[fix] Restart SunshineService to apply config"
+  ansible.windows.win_shell: |
+    $name = (('{{ svc_info.stdout }}' -split "`n" |
+              Where-Object { $_ -match '^SUNSHINE_SVC=' }) -replace '^SUNSHINE_SVC=','').Trim()
+    if (-not $name) { $name = 'SunshineService' }
+    Restart-Service -Name $name -Force
+    Start-Sleep -Seconds 4
+    Write-Host "STATE=$((Get-Service -Name $name).Status)"
+  register: svc_restart
+  become: false
+  vars: *winrm_vars
+
+- name: "[fix] Show restart result"
+  ansible.builtin.debug:
+    msg: "{{ svc_restart.stdout_lines | default(['No output']) }}"
+
+# =======================================================================
+# Verify
+# =======================================================================
+- name: "[fix] Verify listening ports + tail Sunshine log"
+  ansible.windows.win_shell: |
+    Write-Host "=== Sunshine Listening Ports ==="
+    foreach ($port in @(47984,47989,47990,48010)) {
+      $l = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+      if ($l) {
+        $p = Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue
+        Write-Host "  TCP $port : LISTENING ($($p.ProcessName))"
+      } else { Write-Host "  TCP $port : not listening" }
+    }
+    Write-Host "`n=== Active console session ==="
+    & query session 2>$null | Out-String | Write-Host
+    Write-Host "`n=== Display adapters ==="
+    Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+      Where-Object { $_.Status -eq 'OK' } |
+      ForEach-Object { Write-Host "  $($_.FriendlyName)" }
+    Write-Host "`n=== Active monitors (system-wide) ==="
+    Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue |
+      Where-Object { $_.Active } | ForEach-Object { Write-Host "  Active: $($_.InstanceName)" }
+    Write-Host "`n=== Last 40 lines of sunshine.log ==="
+    $log = @(
+      "$env:ProgramFiles\Sunshine\config\sunshine.log",
+      "$env:WINDIR\System32\config\systemprofile\AppData\Roaming\Sunshine\sunshine.log"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($log) { Write-Host "($log)"; Get-Content $log -Tail 40 | ForEach-Object { Write-Host $_ } }
+    else { Write-Host "  (no sunshine.log found)" }
+  register: verify
+  become: false
+  vars: *winrm_vars
+
+- name: "[fix] Show verification"
+  ansible.builtin.debug:
+    msg: "{{ verify.stdout_lines | default(['No output']) }}"
+
+# -----------------------------------------------------------------------
+# Teardown — stop port-forward
+# -----------------------------------------------------------------------
+- name: Stop WinRM port-forward
+  ansible.builtin.shell: |
+    if [ -f /tmp/winrm-pf.pid ]; then
+      kill $(cat /tmp/winrm-pf.pid) 2>/dev/null || true
+      rm -f /tmp/winrm-pf.pid
+    fi
+    pkill -f "kubectl.*port-forward.*5985" 2>/dev/null || true
+  ignore_errors: true
+
+- name: Display Sunshine fix summary
+  ansible.builtin.debug:
+    msg:
+      - "✅ Sunshine breakfix + hardened startup complete"
+      - "   VM      : {{ vm_name }} ({{ kubevirt_namespace }})"
+      - "   Host    : {{ win_hostname.stdout | default('unknown') | trim }}"
+      - ""
+      - "Applied:"
+      - "  • SunshineService -> LocalSystem, delayed-auto, auto-restart recovery"
+      - "  • Persistent autologon so the console keeps a live desktop"
+      - "  • Virtual Display Driver head on the RTX 3090 @ {{ sunshine_stream_width }}x{{ sunshine_stream_height }}"
+      - "  • VDD head SET AS PRIMARY (so Sunshine captures the 3090 -> NVENC)"
+      - "  • sunshine.conf: encoder=nvenc, dd_configuration_option=disabled"
+      - "  • Guest rebooted automatically if the display head was freshly installed"
+      - ""
+      - "IMPORTANT — also run the network offload fix (full veth/tap/k6t path):"
+      - "  ansible-playbook windows-client-controller.yaml -e action=network-install"
+      - "  (without it, UDP 47998 video arrives truncated and Moonlight shows"
+      - "   'no video received' even though NVENC is encoding fine.)"
+      - ""
+      - "Then connect Moonlight to 192.168.100.10 -> Desktop. Verify on the host:"
+      - "  sudo tcpdump -ni br-vm 'udp port 47998' -c 20   # UDP length ~1100, NOT truncated"

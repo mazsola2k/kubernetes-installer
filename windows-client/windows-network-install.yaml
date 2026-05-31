@@ -96,6 +96,51 @@
     fi
   become: true
 
+# ---- Disable segmentation offloads along the ENTIRE VM -> br-vm path ----
+# Disabling offloads on br-vm alone is NOT enough. Sunshine video (UDP 47998)
+# is large; the kernel applies GSO and the unsegmented super-frames are passed
+# through the veth/tap/k6t hops, arriving on br-vm as "truncated-udplength 0",
+# which Moonlight silently drops ("no video received"). Offloads must be off on
+# every hop: br-vm, its veth members, and the tap / k6t-* / *-nic interfaces
+# inside the virt-launcher pod's network namespace.
+#
+# Interface names are dynamic (new veth/netns per VM instance), so we discover
+# them. This is best-effort: it no-ops cleanly if the VM is not running yet.
+# Offload state is per-interface and resets when the VM/pod restarts — re-run
+# action=network-install after starting/restarting the VM.
+- name: Disable GSO/GRO/TSO on br-vm and all veth members
+  ansible.builtin.shell: |
+    set -e
+    OFF="gso off gro off tso off tx-udp-segmentation off rx-udp-gro-forwarding off"
+    ethtool -K br-vm $OFF 2>/dev/null || true
+    echo "br-vm offloads off"
+    for IF in $(ls /sys/class/net/br-vm/brif/ 2>/dev/null); do
+      ethtool -K "$IF" $OFF 2>/dev/null || true
+      echo "veth $IF offloads off"
+    done
+  become: true
+  changed_when: false
+
+- name: Disable offloads inside the virt-launcher pod netns (tap / k6t / nic)
+  ansible.builtin.shell: |
+    set -e
+    OFF="gso off gro off tso off tx-udp-segmentation off rx-udp-gro-forwarding off"
+    # Find the virt-launcher pod sandbox for this VM and its network namespace
+    SANDBOX=$(crictl pods --name "virt-launcher-{{ vm_name }}" -q 2>/dev/null | head -1)
+    [ -z "$SANDBOX" ] && { echo "no running virt-launcher pod for {{ vm_name }} — skipping (start the VM, then re-run)"; exit 0; }
+    NETNS=$(crictl inspectp "$SANDBOX" 2>/dev/null | grep -oE '/var/run/netns/[a-z0-9-]+' | head -1)
+    [ -z "$NETNS" ] && { echo "could not resolve netns for $SANDBOX — skipping"; exit 0; }
+    NS=$(basename "$NETNS")
+    echo "pod netns: $NS"
+    # Disable offloads on every tap*, k6t-*, and *-nic interface in the namespace
+    for IF in $(ip netns exec "$NS" ls /sys/class/net 2>/dev/null | grep -E '^(tap|k6t-)|.*-nic$'); do
+      ip netns exec "$NS" ethtool -K "$IF" $OFF 2>/dev/null || true
+      echo "  $IF offloads off"
+    done
+  become: true
+  changed_when: false
+  ignore_errors: true
+
 # ---- Create Multus NetworkAttachmentDefinition ----
 - name: Create Multus NetworkAttachmentDefinition for Windows LAN
   kubernetes.core.k8s:
