@@ -47,6 +47,8 @@
 #                           freshly installed virtual display head attaches.
 #                           'auto' (default) reboots only if the VDD was just
 #                           installed; 'true' always; 'false' never.
+#   sunshine_install_audio  Install VB-CABLE virtual audio sink (default: true)
+#                           so Moonlight gets sound. Set false to skip.
 
 - name: Set Sunshine fix defaults
   ansible.builtin.set_fact:
@@ -64,6 +66,16 @@
       ) }}
     # GPU the virtual display head composites on (so NVENC reads it directly).
     sunshine_vdd_gpu: "{{ sunshine_vdd_gpu | default('NVIDIA GeForce RTX 3090') }}"
+    # Virtual audio: a headless GPU VM has no audio render endpoint (the NVIDIA
+    # HDMI endpoints are NotPresent without a connected sink), so Sunshine logs
+    # "Couldn't get default audio endpoint" and streams with no sound. VB-CABLE
+    # is a Microsoft-cross-signed virtual sink (loads without test-signing).
+    sunshine_install_audio: "{{ sunshine_install_audio | default('true') }}"
+    sunshine_vbcable_url: "{{ sunshine_vbcable_url | default('https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip') }}"
+    # nefconw creates the root device node for the VB-CABLE / VDD-class drivers.
+    sunshine_nefcon_url: "{{ sunshine_nefcon_url | default('https://github.com/nefarius/nefcon/releases/download/v1.17.40/nefcon_v1.17.40.zip') }}"
+    sunshine_nircmd_url: "{{ sunshine_nircmd_url | default('https://www.nirsoft.net/utils/nircmd-x64.zip') }}"
+    sunshine_audio_sink: ""
   tags: always
 
 # -----------------------------------------------------------------------
@@ -385,7 +397,102 @@
   when: sunshine_install_vdd | bool
 
 # =======================================================================
-# PHASE 3 — pin Sunshine to NVENC, then restart
+# PHASE 2.5 — Virtual audio sink (VB-CABLE) so Moonlight gets sound
+# =======================================================================
+# A headless GPU VM has no active audio render endpoint, so Sunshine logs
+# "Couldn't get default audio endpoint [0x80070490]" and streams silently.
+# VB-CABLE is a Microsoft-cross-signed virtual sink (no test-signing needed).
+# Install path mirrors the manual fix: trust the VB-Audio publisher cert ->
+# create the root device node (nefconw) -> pnputil /add-driver -> set default
+# (nircmd) -> capture the device id for Sunshine's audio_sink.
+- name: "[fix] Check whether a virtual audio sink already exists"
+  ansible.windows.win_shell: |
+    $vb = Get-PnpDevice -EA SilentlyContinue | Where-Object { $_.InstanceId -match 'VBAudioVACWDM' -and $_.Status -eq 'OK' }
+    if ($vb) { Write-Host "AUDIO_PRESENT=true" } else { Write-Host "AUDIO_PRESENT=false" }
+  register: audio_check
+  become: false
+  vars: *winrm_vars
+  when: sunshine_install_audio | bool
+
+- name: "[fix] Install VB-CABLE virtual audio sink + set as default"
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # --- nefconw (creates the root device node) ---
+    $nefDir = 'C:\Tools\nefcon'
+    if (-not (Test-Path "$nefDir\x64\nefconw.exe")) {
+      New-Item -ItemType Directory -Force $nefDir | Out-Null
+      (New-Object Net.WebClient).DownloadFile('{{ sunshine_nefcon_url }}', "$nefDir\nefcon.zip")
+      Expand-Archive "$nefDir\nefcon.zip" $nefDir -Force
+    }
+    $nef = "$nefDir\x64\nefconw.exe"
+
+    # --- VB-CABLE driver pack ---
+    $vbDir = 'C:\Tools\vbcable'
+    if (-not (Test-Path "$vbDir\vbMmeCable64_win7.inf")) {
+      New-Item -ItemType Directory -Force $vbDir | Out-Null
+      (New-Object Net.WebClient).DownloadFile('{{ sunshine_vbcable_url }}', "$vbDir\vbcable.zip")
+      Expand-Archive "$vbDir\vbcable.zip" $vbDir -Force
+    }
+    $inf = "$vbDir\vbMmeCable64_win7.inf"
+    $sys = "$vbDir\vbaudio_cable64_win7.sys"
+
+    # --- trust the VB-Audio publisher (pnputil otherwise rejects the catalog) ---
+    $cert = (Get-AuthenticodeSignature $sys).SignerCertificate
+    $cer  = "$vbDir\vb.cer"; [IO.File]::WriteAllBytes($cer, $cert.Export('Cert'))
+    Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+    Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+
+    # --- create the device node + install the (cross-signed) driver ---
+    & $nef --create-device-node --hardware-id "VBAudioVACWDM" --class-name MEDIA `
+      --class-guid "4d36e96c-e325-11ce-bfc1-08002be10318" 2>&1 | Out-Null
+    & pnputil.exe /add-driver $inf /install 2>&1 | Out-String | Write-Host
+    & pnputil.exe /scan-devices 2>&1 | Out-Null
+    Start-Sleep 6
+
+    # --- nircmd: make VB-CABLE the default render device (all roles) ---
+    $nirDir = 'C:\Tools\nircmd'
+    if (-not (Test-Path "$nirDir\nircmd.exe")) {
+      New-Item -ItemType Directory -Force $nirDir | Out-Null
+      (New-Object Net.WebClient).DownloadFile('{{ sunshine_nircmd_url }}', "$nirDir\nircmd.zip")
+      Expand-Archive "$nirDir\nircmd.zip" $nirDir -Force
+    }
+    & "$nirDir\nircmd.exe" setdefaultsounddevice "VB-Audio Virtual Cable" 1
+    & "$nirDir\nircmd.exe" setdefaultsounddevice "VB-Audio Virtual Cable" 2
+    Start-Sleep 2
+
+    # --- report the active VB-CABLE render endpoint id for audio_sink ---
+    $base = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
+    $sinkId = ''
+    foreach ($k in Get-ChildItem $base -EA SilentlyContinue) {
+      $st = (Get-ItemProperty $k.PSPath -Name DeviceState -EA SilentlyContinue).DeviceState
+      $fn = (Get-ItemProperty "$($k.PSPath)\Properties" -EA SilentlyContinue).'{b3f8fa53-0004-438e-9003-51a46e139bfc},6'
+      if ($st -eq 1 -and $fn -match 'VB-Audio') { $sinkId = "{0.0.0.00000000}.{$($k.PSChildName)}" }
+    }
+    if ($sinkId) { Write-Host "AUDIO_SINK=$sinkId" } else { Write-Host "AUDIO_SINK=" }
+  register: audio_install
+  become: false
+  vars: *winrm_vars
+  async: 600
+  poll: 15
+  ignore_errors: true
+  when:
+    - sunshine_install_audio | bool
+    - "'AUDIO_PRESENT=false' in (audio_check.stdout | default(''))"
+
+- name: "[fix] Show audio install result"
+  ansible.builtin.debug:
+    msg: "{{ audio_install.stdout_lines | default(['skipped — audio sink already present']) }}"
+
+- name: "[fix] Capture the VB-CABLE audio_sink id (if installed this run)"
+  ansible.builtin.set_fact:
+    sunshine_audio_sink: >-
+      {{ (audio_install.stdout | default('') | regex_search('AUDIO_SINK=(.+)', '\\1') | default([], true) | first | default('', true) | trim) }}
+  when: audio_install is defined and (audio_install.stdout is defined)
+
+# =======================================================================
+# PHASE 3 — pin Sunshine to NVENC (+ audio), then restart
 # =======================================================================
 
 - name: "[fix] Write a known-good sunshine.conf (force NVENC)"
@@ -416,6 +523,10 @@
       'nvenc_preset = 1',
       'min_log_level = info'
     )
+    # audio_sink pins capture to the VB-CABLE virtual sink (also the default
+    # device). Templated in only when a sink id was resolved this run.
+    $sink = '{{ sunshine_audio_sink | default("") }}'
+    if ($sink) { $lines += "audio_sink = $sink" }
     Set-Content -Path $conf -Value $lines -Encoding ascii
     Write-Host "Wrote $conf"
     Get-Content $conf | ForEach-Object { Write-Host "  $_" }
@@ -504,7 +615,8 @@
       - "  • Persistent autologon so the console keeps a live desktop"
       - "  • Virtual Display Driver head on the RTX 3090 @ {{ sunshine_stream_width }}x{{ sunshine_stream_height }}"
       - "  • VDD head SET AS PRIMARY (so Sunshine captures the 3090 -> NVENC)"
-      - "  • sunshine.conf: encoder=nvenc, dd_configuration_option=disabled"
+      - "  • VB-CABLE virtual audio sink installed + set default (Moonlight gets sound)"
+      - "  • sunshine.conf: encoder=nvenc, dd_configuration_option=disabled, audio_sink"
       - "  • Guest rebooted automatically if the display head was freshly installed"
       - ""
       - "IMPORTANT — also run the network offload fix (full veth/tap/k6t path):"

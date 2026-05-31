@@ -48,6 +48,7 @@
 #                          stack (VDD+primary+NVENC). Default true (turnkey).
 #                          Set false to install the Sunshine binary only.
 #   sunshine_install_vdd   Install the Virtual Display Driver (default: true)
+#   sunshine_install_audio Install VB-CABLE virtual audio sink (default: true)
 #   sunshine_vdd_gpu       GPU the VDD head composites on (default: 'NVIDIA GeForce RTX 3090')
 #   sunshine_stream_width  VDD head width  (default: 2560)
 #   sunshine_stream_height VDD head height (default: 1080)

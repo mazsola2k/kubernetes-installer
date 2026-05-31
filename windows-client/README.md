@@ -591,6 +591,7 @@ Once the GPU is passed through and the NVIDIA driver is installed, you can use *
 │                                 │  KubeVirt Windows 11 VM  192.168.100.10  │  │
 │                                 │  SunshineService (LocalSystem)           │  │
 │                                 │    encoder=nvenc  →  hevc_nvenc          │  │
+│                                 │    audio_sink → VB-CABLE virtual sink    │  │
 │                                 │  Virtual Display Driver head = PRIMARY ───┼──┐
 │                                 │  RTX 3090 GPU (vfio-pci) renders the head │  ││
 │                                 └──────────────────────────────────────────┘  ││
@@ -619,7 +620,7 @@ The `windows-client-controller.yaml -e action=install` playbook:
 2. **Kubernetes Service** — Creates `win11client-sunshine` ClusterIP service with `externalIPs` mapping all Sunshine ports to the host node IP.
 3. **Bridge network (`br-vm`)** — Creates a host bridge at `192.168.100.1/24` with a Multus `NetworkAttachmentDefinition` (`win-lan`), giving the VM a second NIC directly on the bridge.
 4. **Network offload fix** — Disables GSO/GRO/TSO/tx-udp-segmentation along the **entire** VM→bridge path: `br-vm`, its veth members, and the `tap*`/`k6t-*`/`*-nic` interfaces inside the virt-launcher pod's netns (see below).
-5. **Streaming capture stack** — `action=sunshine-install` installs Sunshine; `action=sunshine-fix` configures the Virtual Display Driver, primary display, NVENC and the service (see [Virtual Display](#virtual-display--why-it-is-required-and-how-it-is-configured)).
+5. **Streaming capture stack** — `action=sunshine-install` installs Sunshine; `action=sunshine-fix` configures the Virtual Display Driver, primary display, **VB-CABLE virtual audio**, NVENC and the service (see [Virtual Display + Virtual Audio](#virtual-display--virtual-audio--why-they-are-required-and-how-they-are-configured)).
 
 ### Critical: Bridge Network Offload Fix
 
@@ -692,7 +693,7 @@ ansible-playbook windows-client-controller.yaml -e action=network-install
 # 2. (Re)create the VM so it picks up the br-vm NIC, then install the GPU driver
 #    ... action=reinstall / nvidia-driver as needed ...
 # 3. Turnkey streaming: installs Sunshine AND configures the capture stack
-#    (VDD + primary display + NVENC + hardened LocalSystem service)
+#    (VDD + primary display + VB-CABLE audio + NVENC + hardened LocalSystem service)
 ansible-playbook windows-client-controller.yaml -e action=sunshine-install
 # 4. Re-run the offload fix now the VM is up (disables GSO on the full veth/tap/k6t path)
 ansible-playbook windows-client-controller.yaml -e action=network-install
@@ -720,7 +721,7 @@ Then on the client:
 > `action=network-install` assigns it. `virtctl vnc` shows only the emulated QEMU display, never
 > the streamed VDD/3090 head (expected).
 
-### Virtual Display — why it is required, and how it is configured
+### Virtual Display + Virtual Audio — why they are required, and how they are configured
 
 A passed-through **GeForce RTX 3090 has no NvFBC** (NVIDIA restricts NvFBC desktop capture to
 Quadro/datacenter cards), so Sunshine uses the Windows **Desktop Duplication API (DXGI)**, which
@@ -733,16 +734,30 @@ The fix is a **Virtual Display Driver (VDD)** — an Indirect Display Driver tha
 virtual monitor **bound to the RTX 3090**. With that head set as the **primary display**,
 Sunshine's default capture grabs the 3090 output and encodes with **NVENC (`hevc_nvenc`)**.
 
+Audio has the same shape of problem: a headless GPU VM has **no active audio render endpoint**
+(the NVIDIA HDMI endpoints are `NotPresent` with no monitor connected), so Sunshine logs
+`Couldn't get default audio endpoint [0x80070490]` and streams silently. The fix is a **virtual
+audio sink** — **VB-CABLE** — set as the default playback device; app audio routes into it and
+Sunshine captures it. (You won't hear sound *on the VM* — that's correct; it comes out on the
+Moonlight client.)
+
 Verified working configuration on `win11client`:
 
 | Component | Value |
 |-----------|-------|
-| VDD | [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) **signed** `25.5.2` x64 setup (loads without test-signing; SecureBoot is off) |
+| VDD | [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) **signed** `25.5.2` x64 setup (WHQL/attestation-signed → loads without test-signing) |
 | `C:\VirtualDisplayDriver\vdd_settings.xml` | `<gpu><friendlyname>NVIDIA GeForce RTX 3090</friendlyname></gpu>`, resolutions incl. the stream res |
-| Primary display | the VDD head (`MTT1337`), set with **NirSoft MultiMonitorTool** `/SetPrimary` (run in the interactive session via a scheduled task — a session-0 service cannot change session-1 layout) |
-| `C:\Program Files\Sunshine\config\sunshine.conf` | `encoder = nvenc` · `dd_configuration_option = disabled` · `nvenc_preset = 1` |
+| Primary display | the VDD head (`MTT1337`), set with **NirSoft MultiMonitorTool** `/SetPrimary`, re-asserted on every boot by the **`VddSetPrimary`** logon task (Windows reverts primary on reboot otherwise) |
+| Virtual audio | **VB-CABLE** (VB-Audio, Microsoft-cross-signed → no test-signing). Root device node created with **nefconw**, driver installed via `pnputil`, set default with **nircmd** |
+| `C:\Program Files\Sunshine\config\sunshine.conf` | `encoder = nvenc` · `dd_configuration_option = disabled` · `nvenc_preset = 1` · `audio_sink = {0.0.0.00000000}.{<vb-cable guid>}` |
 | `SunshineService` | `LocalSystem`, **Automatic (Delayed)**, auto-restart recovery |
 | Autologon | `AutoAdminLogon=1`, no `LogonCount` cap (console keeps a live desktop) |
+
+> **Driver signing gotcha:** the MTT *audio* driver is signed by SignPath (not MS-cross-signed),
+> so it hit **Code 52** under kernel Driver Signature Enforcement and would need test-signing
+> (which paints a "Test Mode" watermark *into the stream*). VB-CABLE is Microsoft-cross-signed,
+> so it loads cleanly — you only have to trust the VB-Audio publisher cert so `pnputil` accepts
+> the catalog. The VDD loads without test-signing for the same reason (it's attestation-signed).
 
 > Why `dd_configuration_option = disabled` and **not** `output_name`/`ensure_primary`:
 > pinning Sunshine to a specific `\\.\DISPLAYn` is unreliable because GDI display numbers
@@ -754,7 +769,8 @@ Verified working configuration on `win11client`:
 
 Moonlight **connects** (TCP/RTSP OK, Sunshine logs `CLIENT CONNECTED`) then drops after ~11s with
 *"no video received — check UDP 47998/48000."* On this stack there were **three independent
-faults**, all confirmed live with packet captures and `sunshine.log`. Work through them in order:
+faults** (plus audio), all confirmed live with packet captures and `sunshine.log`. Work through
+them in order:
 
 **1. Service** — `SunshineService` must be **Running / Automatic / LocalSystem**. A named
 account (e.g. `.\Administrator`) or a Disabled service cannot capture the interactive console.
@@ -768,7 +784,7 @@ Microsoft Basic Render Driver … 1280x800 … Creating encoder [libx264]   ← 
 NVIDIA GeForce RTX 3090 … 1920x1080 … Creating encoder [hevc_nvenc]      ← CORRECT (VDD on 3090)
 ```
 If you see the WARP/`libx264` case, the **VDD head is not primary** (or not installed). See
-[Virtual Display](#virtual-display--why-it-is-required-and-how-it-is-configured) above. You can
+[Virtual Display + Virtual Audio](#virtual-display--virtual-audio--why-they-are-required-and-how-they-are-configured) above. You can
 confirm the topology with Sunshine's bundled probe, run in the interactive session:
 `C:\Program Files\Sunshine\tools\dxgi-info.exe` — the 3090 should list an attached `OUTPUT`.
 
@@ -789,10 +805,18 @@ This is fixed automatically by **`action=network-install`**, which now disables 
 virt-launcher pod's netns (see [the offload fix below](#critical-bridge-network-offload-fix)).
 Offload state resets when the VM/pod restarts — **re-run `network-install` after (re)starting the VM.**
 
+**4. Audio (no sound, video fine)** — `sunshine.log` shows
+`Couldn't get default audio endpoint [0x80070490]` because the headless GPU VM has no active
+render endpoint. Fixed by the VB-CABLE virtual sink (installed by `sunshine-install`/`sunshine-fix`).
+Confirm Sunshine sees exactly one active device:
+```powershell
+& 'C:\Program Files\Sunshine\tools\audio-info.exe'   # expect: Speakers (VB-Audio Virtual Cable), Active
+```
+
 #### The two playbooks that fix it
 
 ```bash
-# 1) Guest side: service + VDD + primary display + NVENC config (+ optional guest reboot)
+# 1) Guest side: service + VDD + primary display + VB-CABLE audio + NVENC config (+ guest reboot)
 ansible-playbook windows-client-controller.yaml -e action=sunshine-fix
 
 # 2) Host side: full-path GSO/offload fix + br-vm host IP  (re-run after each VM restart)
@@ -805,13 +829,15 @@ ansible-playbook windows-client-controller.yaml -e action=network-install
 |-------|--------------|
 | **Service** | Restores `SunshineService` to **LocalSystem**, **Automatic (Delayed)**, with auto-restart recovery. |
 | **Autologon** | Makes autologon persistent (removes the `LogonCount` cap) so the console keeps a live desktop; stops disconnected RDP sessions from locking it. |
-| **Capture surface** | Installs the signed **Virtual Display Driver**, writes `vdd_settings.xml` (GPU = RTX 3090 + resolution), reboots the guest if newly installed so the head attaches, then **sets the VDD head as the primary display** (MultiMonitorTool). |
-| **Encoder** | Writes the verified `sunshine.conf` (`encoder=nvenc`, `dd_configuration_option=disabled`). |
+| **Capture surface** | Installs the signed **Virtual Display Driver**, writes `vdd_settings.xml` (GPU = RTX 3090 + resolution), reboots the guest if newly installed so the head attaches, then **sets the VDD head as the primary display** (MultiMonitorTool + persistent `VddSetPrimary` logon task). |
+| **Virtual audio** | Installs **VB-CABLE** (trust publisher cert → nefconw device node → `pnputil`), sets it the default playback device (nircmd), and resolves its endpoint id for `audio_sink`. |
+| **Encoder** | Writes the verified `sunshine.conf` (`encoder=nvenc`, `dd_configuration_option=disabled`, `audio_sink=<vb-cable>`). |
 | **Verify** | Reports ports, active session, display adapters/monitors, and the `sunshine.log` tail. |
 
 Useful overrides:
 ```bash
 -e sunshine_install_vdd=false                         # using a physical dummy HDMI/DP plug instead
+-e sunshine_install_audio=false                       # skip VB-CABLE (no virtual audio)
 -e sunshine_reboot=false                              # auto (default) | true | false
 -e sunshine_stream_width=2560 -e sunshine_stream_height=1080
 -e sunshine_vdd_gpu="NVIDIA GeForce RTX 3090"         # GPU the VDD head composites on
