@@ -485,11 +485,29 @@
   ansible.builtin.debug:
     msg: "{{ audio_install.stdout_lines | default(['skipped — audio sink already present']) }}"
 
-- name: "[fix] Capture the VB-CABLE audio_sink id (if installed this run)"
+# Resolve the active VB-CABLE render-endpoint id every run (not only when freshly
+# installed) so sunshine.conf always pins audio_sink to it.
+- name: "[fix] Resolve the VB-CABLE audio sink id for audio_sink"
+  ansible.windows.win_shell: |
+    $base = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
+    $sinkId = ''
+    foreach ($k in Get-ChildItem $base -EA SilentlyContinue) {
+      $st = (Get-ItemProperty $k.PSPath -Name DeviceState -EA SilentlyContinue).DeviceState
+      $fn = (Get-ItemProperty "$($k.PSPath)\Properties" -EA SilentlyContinue).'{b3f8fa53-0004-438e-9003-51a46e139bfc},6'
+      if ($st -eq 1 -and $fn -match 'VB-Audio') { $sinkId = "{0.0.0.00000000}.{$($k.PSChildName)}" }
+    }
+    Write-Host "AUDIO_SINK=$sinkId"
+  register: audio_sink_probe
+  become: false
+  vars: *winrm_vars
+  ignore_errors: true
+  when: sunshine_install_audio | bool
+
+- name: "[fix] Set audio_sink fact from the resolved VB-CABLE endpoint"
   ansible.builtin.set_fact:
     sunshine_audio_sink: >-
-      {{ (audio_install.stdout | default('') | regex_search('AUDIO_SINK=(.+)', '\\1') | default([], true) | first | default('', true) | trim) }}
-  when: audio_install is defined and (audio_install.stdout is defined)
+      {{ (audio_sink_probe.stdout | default('') | regex_search('AUDIO_SINK=(.+)', '\\1') | default([], true) | first | default('', true) | trim) }}
+  when: audio_sink_probe is defined and (audio_sink_probe.stdout is defined)
 
 # =======================================================================
 # PHASE 3 — pin Sunshine to NVENC (+ audio), then restart
